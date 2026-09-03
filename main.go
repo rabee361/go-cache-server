@@ -5,13 +5,14 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"log"
 )
 
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte) (uint64, error)
-	// Delete(key string) uint64
-	// Exists(key string) bool
+	Delete(key string) uint64
+	Exists(key string) bool
 }
 
 type StoreValue struct {
@@ -54,9 +55,9 @@ func (s *MemoryStore) Exists(key string) (bool, error) {
 
 func startServer() {
 	err := http.ListenAndServe("localhost:8080", nil)
-	fmt.Println("Server started on localhost:8080")
+	log.Println("Server started on localhost:8080")
 	if err != nil {
-		fmt.Println("Failed to start server")
+		log.Println("Failed to start server")
 		return
 	}
 }
@@ -73,7 +74,7 @@ func (s *MemoryStore) setValueHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to set value", http.StatusInternalServerError)
 		return
 	}
-	fmt.Println("Value set")
+	log.Println("Value set")
 }
 
 func (s *MemoryStore) getValueHandler(w http.ResponseWriter, r *http.Request) {
@@ -82,9 +83,9 @@ func (s *MemoryStore) getValueHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := r.FormValue("key")
-	fmt.Println("key is ", key)
+	log.Println("key =", key)
 	value, _ := s.Get(key)
-	fmt.Println(string(value))
+	log.Println("value =", string(value))
 }
 
 func (s *MemoryStore) existsValueHandler(w http.ResponseWriter, r *http.Request) {
@@ -107,9 +108,9 @@ func (s *MemoryStore) deleteValueHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	key := r.FormValue("key")
-	fmt.Println("key is ", key)
+	log.Println("key =", key)
 	value, _ := s.Delete(key)
-	fmt.Println(string(value))
+	log.Println("value =", string(value))
 }
 
 func main() {
@@ -117,6 +118,7 @@ func main() {
 		mu:    sync.RWMutex{},
 		value: StoreValue{make(map[string][]byte), time.Now().Add(60 * time.Second)},
 	}
+	// http.HandleFunc("/health", store.getHealth)
 	http.HandleFunc("/cache/get", store.getValueHandler)
 	http.HandleFunc("/cache/set", store.setValueHandler)
 	http.HandleFunc("/cache/delete", store.deleteValueHandler)
