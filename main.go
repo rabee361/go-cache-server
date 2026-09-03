@@ -1,12 +1,44 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
-	"log"
 )
+
+// Response is the standard envelope for all cache API responses.
+type Response struct {
+	Status  string      `json:"status"`
+	Code    string      `json:"code"`
+	Message string      `json:"message,omitempty"`
+	Data    interface{} `json:"data,omitempty"`
+	Ts      int64       `json:"ts"`
+}
+
+// writeJSON sends a JSON Response to the client.
+func writeJSON(w http.ResponseWriter, status int, code string, message string, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	resp := Response{
+		Status:  httpStatusText(status),
+		Code:    code,
+		Message: message,
+		Data:    data,
+		Ts:      time.Now().Unix(),
+	}
+	b, _ := json.Marshal(resp)
+	w.Write(b)
+}
+
+func httpStatusText(code int) string {
+	if code >= 200 && code < 300 {
+		return "ok"
+	}
+	return "error"
+}
 
 type Store interface {
 	Get(key string) ([]byte, bool)
@@ -64,53 +96,118 @@ func startServer() {
 
 func (s *MemoryStore) setValueHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
 	}
 	key := r.FormValue("key")
-	value := r.FormValue("value")
-	_, err := s.Set(key, []byte(value))
-	if err != nil {
-		http.Error(w, "Failed to set value", http.StatusInternalServerError)
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, "MISSING_KEY", "missing key parameter", nil)
 		return
 	}
-	log.Println("Value set")
+	value := r.FormValue("value")
+	if _, err := s.Set(key, []byte(value)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, "SET_FAILED", "set operation failed: "+err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, "SET_OK", "", map[string]string{"key": key})
 }
 
 func (s *MemoryStore) getValueHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
 	}
 	key := r.FormValue("key")
-	log.Println("key =", key)
-	value, _ := s.Get(key)
-	log.Println("value =", string(value))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, "MISSING_KEY", "missing key parameter", nil)
+		return
+	}
+	value, exists := s.Get(key)
+	if !exists {
+		writeJSON(w, http.StatusNotFound, "NOT_FOUND", "key not found", map[string]string{"key": key})
+		return
+	}
+	writeJSON(w, http.StatusOK, "GET_OK", "", map[string]string{"key": key, "value": string(value)})
 }
 
 func (s *MemoryStore) existsValueHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
 	}
 	key := r.FormValue("key")
-	exists, _ := s.Exists(key)
-	if exists {
-		fmt.Fprintf(w, "Key exists")
-	} else {
-		fmt.Fprintf(w, "Key does not exist")
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, "MISSING_KEY", "missing key parameter", nil)
+		return
 	}
+	exists, _ := s.Exists(key)
+	if !exists {
+		writeJSON(w, http.StatusNotFound, "NOT_FOUND", "key not found", map[string]interface{}{"key": key, "exists": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, "EXISTS_OK", "", map[string]interface{}{"key": key, "exists": true})
 }
 
 func (s *MemoryStore) deleteValueHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+	if r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 		return
 	}
 	key := r.FormValue("key")
-	log.Println("key =", key)
-	value, _ := s.Delete(key)
-	log.Println("value =", string(value))
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, "MISSING_KEY", "missing key parameter", nil)
+		return
+	}
+	if _, err := s.Delete(key); err != nil {
+		writeJSON(w, http.StatusInternalServerError, "DELETE_FAILED", "delete operation failed: "+err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, "DELETE_OK", "", map[string]string{"key": key})
+}
+
+// healthHandler is a liveness probe. It returns 200 OK if the server is running.
+func (s *MemoryStore) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, "HEALTH_OK", "", map[string]bool{"alive": true})
+}
+
+// readyHandler is a readiness probe. It performs a smoke test against the store
+// and returns 200 OK only if set/get/delete all succeed.
+func (s *MemoryStore) readyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+		return
+	}
+
+	key := fmt.Sprintf("_health_check_%d", time.Now().UnixNano())
+	testValue := []byte("ok")
+
+	if _, err := s.Set(key, testValue); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, "NOT_READY", "set failed: "+err.Error(), nil)
+		return
+	}
+	defer s.Delete(key)
+
+	got, ok := s.Get(key)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, "NOT_READY", "get failed: key not found after set", nil)
+		return
+	}
+
+	if string(got) != string(testValue) {
+		writeJSON(w, http.StatusServiceUnavailable, "NOT_READY", "get returned wrong value", nil)
+		return
+	}
+
+	if _, err := s.Delete(key); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, "NOT_READY", "delete failed: "+err.Error(), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, "READY", "", map[string]bool{"ready": true})
 }
 
 func main() {
@@ -118,7 +215,8 @@ func main() {
 		mu:    sync.RWMutex{},
 		value: StoreValue{make(map[string][]byte), time.Now().Add(60 * time.Second)},
 	}
-	// http.HandleFunc("/health", store.getHealth)
+	http.HandleFunc("/health", store.healthHandler)
+	http.HandleFunc("/health/ready", store.readyHandler)
 	http.HandleFunc("/cache/get", store.getValueHandler)
 	http.HandleFunc("/cache/set", store.setValueHandler)
 	http.HandleFunc("/cache/delete", store.deleteValueHandler)
