@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// Response is the standard envelope for all cache API responses.
 type Response struct {
 	Status  string      `json:"status"`
 	Code    string      `json:"code"`
@@ -18,7 +17,6 @@ type Response struct {
 	Ts      int64       `json:"ts"`
 }
 
-// writeJSON sends a JSON Response to the client.
 func writeJSON(w http.ResponseWriter, status int, code string, message string, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -165,7 +163,6 @@ func (s *MemoryStore) deleteValueHandler(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, "DELETE_OK", "", map[string]string{"key": key})
 }
 
-// healthHandler is a liveness probe. It returns 200 OK if the server is running.
 func (s *MemoryStore) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
@@ -174,8 +171,6 @@ func (s *MemoryStore) healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, "HEALTH_OK", "", map[string]bool{"alive": true})
 }
 
-// readyHandler is a readiness probe. It performs a smoke test against the store
-// and returns 200 OK only if set/get/delete all succeed.
 func (s *MemoryStore) readyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)

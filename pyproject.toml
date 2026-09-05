@@ -1,0 +1,20 @@
+[project]
+name = "go-cache-server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "rabee361", email = "rha60540@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "django>=6.1.1",
+    "djangorestframework>=3.18.0",
+]
+
+[project.scripts]
+go-cache-server = "go_cache_server:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
