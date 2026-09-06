@@ -7,11 +7,17 @@ class GoCacheBackend(BaseCache):
         self.client = GoCacheClient(host)
         super().__init__(*args, **kwargs)
 
-    def add(self):
-        pass
+    def add(self, key, value):
+        self.client.set(key, value)
+        return True
 
     def set(self, key, value):
+        print("Calling set")
         self.client.set(key, value)
+        return True
 
     def get(self, key):
         return self.client.get(key)
+
+
+    

@@ -57,6 +57,8 @@ type MemoryStore struct {
 
 func (s *MemoryStore) Set(key string, value []byte) (uint64, error) {
 	s.mu.Lock()
+	fmt.Println("Setting value for key:", key)
+	fmt.Println("Setting value for value:", value)
 	s.value.data[key] = value
 	s.mu.Unlock()
 	return 0, nil
@@ -121,6 +123,8 @@ func (s *MemoryStore) getValueHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	value, exists := s.Get(key)
+	fmt.Println("Getting value for key:", key)
+	fmt.Println(value)
 	if !exists {
 		writeJSON(w, http.StatusNotFound, "NOT_FOUND", "key not found", map[string]string{"key": key})
 		return

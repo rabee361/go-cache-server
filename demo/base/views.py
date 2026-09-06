@@ -14,7 +14,8 @@ class PostView(APIView):
             posts_query = Post.objects.all()
             cache.set("posts_query", posts_query)
             posts = posts_query
-        print(posts)
+        print("posts are  : " , posts)
+        print("posts from query are  : " , Post.objects.all())
 
         serializer = PostSerializer(posts, many=True)
         return Response(serializer.data)
