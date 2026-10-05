@@ -1,44 +1,16 @@
 package main
 
-// NOTE: The Store interface declares Delete(key string) uint64 and Exists(key string) bool,
-// but MemoryStore implements Delete(key string) (uint64, error) and Exists(key string) (bool, error).
-// This is a signature mismatch — MemoryStore does NOT satisfy the Store interface as written.
-// These tests exercise the concrete MemoryStore type directly.
-
 import (
-	"encoding/json"
+	"bufio"
+	"bytes"
+	"errors"
 	"io"
-	"net/http"
-	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 )
-
-// parseResponse decodes the JSON Response envelope from an httptest.ResponseRecorder.
-func parseResponse(t *testing.T, w *httptest.ResponseRecorder) Response {
-	t.Helper()
-	var resp Response
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode JSON response: %v\nbody: %s", err, w.Body.String())
-	}
-	return resp
-}
-
-// parseHTTPResponse decodes the JSON Response envelope from an *http.Response.
-func parseHTTPResponse(t *testing.T, resp *http.Response) Response {
-	t.Helper()
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("failed to read response body: %v", err)
-	}
-	var r Response
-	if err := json.Unmarshal(body, &r); err != nil {
-		t.Fatalf("failed to decode JSON response: %v\nbody: %s", err, string(body))
-	}
-	return r
-}
 
 // newTestStore returns a fresh MemoryStore with an initialized map.
 func newTestStore() *MemoryStore {
@@ -160,10 +132,10 @@ func TestDelete(t *testing.T) {
 		verifyKey    string
 		verifyExists bool
 	}{
-		{"delete_existing_key", "foo", map[string][]byte{"foo": []byte("bar")}, 0, false, "foo", false},
+		{"delete_existing_key", "foo", map[string][]byte{"foo": []byte("bar")}, 1, false, "foo", false},
 		{"delete_missing_key", "nope", map[string][]byte{}, 0, false, "nope", false},
-		{"delete_empty_key", "", map[string][]byte{"": []byte("val")}, 0, false, "", false},
-		{"delete_then_set_again", "x", map[string][]byte{"x": []byte("1")}, 0, false, "x", true},
+		{"delete_empty_key", "", map[string][]byte{"": []byte("val")}, 1, false, "", false},
+		{"delete_then_set_again", "x", map[string][]byte{"x": []byte("1")}, 1, false, "x", true},
 		{"delete_nonexistent_empty_key", "", map[string][]byte{}, 0, false, "", false},
 	}
 
@@ -290,594 +262,224 @@ func TestConcurrentAccess(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2: HTTP handler tests
+// Encoder tests
 // ---------------------------------------------------------------------------
 
-func TestSetValueHandler(t *testing.T) {
+func TestWriteReply(t *testing.T) {
+	tests := []struct {
+		name string
+		in   Reply
+		want string
+	}{
+		{"simple_string", simpleString("OK"), "+OK\r\n"},
+		{"error", errReply("ERR x"), "-ERR x\r\n"},
+		{"integer", intReply(42), ":42\r\n"},
+		{"negative_integer", intReply(-1), ":-1\r\n"},
+		{"bulk", bulkReply([]byte("hello")), "$5\r\nhello\r\n"},
+		{"null", nullReply(), "$-1\r\n"},
+		{"empty_bulk", bulkReply([]byte("")), "$0\r\n\r\n"},
+		{"error_crlf_sanitized", errReply("bad\r\nmsg"), "-bad  msg\r\n"},
+		{"array", Reply{Kind: '*', Arr: []Reply{simpleString("OK"), intReply(1)}}, "*2\r\n+OK\r\n:1\r\n"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			w := bufio.NewWriter(&buf)
+			if err := writeReply(w, tc.in); err != nil {
+				t.Fatalf("writeReply: %v", err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if got := buf.String(); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteReplyDoesNotFlush(t *testing.T) {
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	if err := writeReply(w, simpleString("OK")); err != nil {
+		t.Fatalf("writeReply: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("writeReply wrote to the underlying buffer without Flush: %q", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Decoder tests
+// ---------------------------------------------------------------------------
+
+func TestReadCommand(t *testing.T) {
 	tests := []struct {
 		name       string
-		method     string
-		key        string
-		value      string
-		wantCode   int
-		wantStatus string
-		wantJSON   string
-		verifyKey  string
-		verifyVal  string
+		input      string
+		want       []string
+		wantEOF    bool
+		wantErrMsg string
 	}{
-		{"set_valid_post", http.MethodPost, "foo", "bar", 200, "ok", "SET_OK", "foo", "bar"},
-		{"set_wrong_method_get", http.MethodGet, "", "", 405, "error", "METHOD_NOT_ALLOWED", "", ""},
-		{"set_wrong_method_put", http.MethodPut, "", "", 405, "error", "METHOD_NOT_ALLOWED", "", ""},
-		{"set_empty_key_value", http.MethodPost, "", "", 400, "error", "MISSING_KEY", "", ""},
-		{"set_overwrite", http.MethodPost, "k", "v2", 200, "ok", "SET_OK", "k", "v2"},
+		{"array_set", "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", []string{"SET", "foo", "bar"}, false, ""},
+		{"array_get", "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", []string{"GET", "k"}, false, ""},
+		{"inline", "SET foo bar\r\n", []string{"SET", "foo", "bar"}, false, ""},
+		{"inline_ping", "PING\r\n", []string{"PING"}, false, ""},
+		{"inline_extra_spaces", "  GET   foo  \r\n", []string{"GET", "foo"}, false, ""},
+		{"empty_inline_line", "\r\n", []string{}, false, ""},
+		{"empty_value", "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n", []string{"SET", "k", ""}, false, ""},
+		{"value_with_crlf", "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$7\r\na\r\nb\r\nc\r\n", []string{"SET", "k", "a\r\nb\r\nc"}, false, ""},
+		{"array_zero_len", "*0\r\n", nil, false, "invalid multibulk length"},
+		{"oversized_bulk", "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$2097153\r\n", nil, false, "invalid bulk length"},
+		{"missing_terminator", "*1\r\n$4\r\nPINGxx\r\n", nil, false, "terminator"},
+		{"truncated_bulk", "*1\r\n$4\r\nPI", nil, false, "unexpected EOF"},
+		{"truncated_inline", "PING", nil, false, "truncated"},
+		{"eof", "", nil, true, ""},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
-
-			if tc.name == "set_overwrite" {
-				s.Set("k", []byte("v1"))
-			}
-
-			var req *http.Request
-			if tc.method == http.MethodPost {
-				body := strings.NewReader("key=" + tc.key + "&value=" + tc.value)
-				req = httptest.NewRequest(tc.method, "/cache/set", body)
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			} else {
-				req = httptest.NewRequest(tc.method, "/cache/set", nil)
-			}
-
-			w := httptest.NewRecorder()
-			s.setValueHandler(w, req)
-
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if resp.Code != tc.wantJSON {
-				t.Errorf("code field = %q, want %q", resp.Code, tc.wantJSON)
-			}
-
-			if tc.verifyKey != "" {
-				got, ok := s.Get(tc.verifyKey)
-				if !ok {
-					t.Errorf("store has no key %q after Set", tc.verifyKey)
-				} else if string(got) != tc.verifyVal {
-					t.Errorf("store[%q] = %q, want %q", tc.verifyKey, got, tc.verifyVal)
+			r := bufio.NewReader(strings.NewReader(tc.input))
+			got, err := readCommand(r)
+			if tc.wantEOF {
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("got err %v, want io.EOF", err)
 				}
+				return
+			}
+			if tc.wantErrMsg != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErrMsg) {
+					t.Fatalf("got err %v, want error containing %q", err, tc.wantErrMsg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readCommand: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %#v, want %#v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestGetValueHandler(t *testing.T) {
-	tests := []struct {
-		name        string
-		method      string
-		key         string
-		prePopulate map[string][]byte
-		wantCode    int
-		wantStatus  string
-		wantCode2   string
-		wantValue   string
-		wantExists  bool
-	}{
-		{"get_existing_key", http.MethodGet, "foo", map[string][]byte{"foo": []byte("bar")}, 200, "ok", "GET_OK", "bar", true},
-		{"get_missing_key", http.MethodGet, "nope", map[string][]byte{}, 404, "error", "NOT_FOUND", "", false},
-		{"get_wrong_method", http.MethodPost, "", map[string][]byte{}, 405, "error", "METHOD_NOT_ALLOWED", "", false},
-		{"get_empty_key", http.MethodGet, "", map[string][]byte{"": []byte("found")}, 400, "error", "MISSING_KEY", "", false},
-		{"get_empty_key_missing", http.MethodGet, "", map[string][]byte{}, 400, "error", "MISSING_KEY", "", false},
+func TestReadCommandFragmented(t *testing.T) {
+	input := "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+	r := bufio.NewReader(iotest.OneByteReader(strings.NewReader(input)))
+	got, err := readCommand(r)
+	if err != nil {
+		t.Fatalf("readCommand: %v", err)
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
-			populateStore(s, tc.prePopulate)
-
-			url := "/cache/get?key=" + tc.key
-			req := httptest.NewRequest(tc.method, url, nil)
-			w := httptest.NewRecorder()
-
-			s.getValueHandler(w, req)
-
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if resp.Code != tc.wantCode2 {
-				t.Errorf("code field = %q, want %q", resp.Code, tc.wantCode2)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			if tc.wantExists && resp.Data != nil {
-				data, ok := resp.Data.(map[string]interface{})
-				if !ok {
-					t.Fatalf("data is not a map: %v", resp.Data)
-				}
-				if gotVal, ok := data["value"]; !ok || gotVal.(string) != tc.wantValue {
-					t.Errorf("data.value = %v, want %q", gotVal, tc.wantValue)
-				}
-			}
-		})
+	want := []string{"SET", "foo", "bar"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %#v, want %#v", got, want)
 	}
 }
 
-func TestExistsValueHandler(t *testing.T) {
-	tests := []struct {
-		name        string
-		method      string
-		key         string
-		prePopulate map[string][]byte
-		wantCode    int
-		wantStatus  string
-		wantExists  bool
-	}{
-		{"exists_present_key", http.MethodGet, "foo", map[string][]byte{"foo": []byte("bar")}, 200, "ok", true},
-		{"exists_absent_key", http.MethodGet, "nope", map[string][]byte{}, 404, "error", false},
-		{"exists_wrong_method", http.MethodPost, "", map[string][]byte{}, 405, "error", false},
-		{"exists_empty_key_present", http.MethodGet, "", map[string][]byte{"": []byte("x")}, 400, "error", false},
-		{"exists_after_delete", http.MethodGet, "tmp", map[string][]byte{"tmp": []byte("v")}, 404, "error", false},
+func TestReadCommandTwoCommands(t *testing.T) {
+	input := "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n"
+	r := bufio.NewReader(strings.NewReader(input))
+	for i := 0; i < 2; i++ {
+		got, err := readCommand(r)
+		if err != nil {
+			t.Fatalf("command %d: %v", i, err)
+		}
+		if !reflect.DeepEqual(got, []string{"PING"}) {
+			t.Errorf("command %d: got %#v", i, got)
+		}
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
-			populateStore(s, tc.prePopulate)
-
-			if tc.name == "exists_after_delete" {
-				s.Delete("tmp")
-			}
-
-			url := "/cache/exists?key=" + tc.key
-			req := httptest.NewRequest(tc.method, url, nil)
-			w := httptest.NewRecorder()
-
-			s.existsValueHandler(w, req)
-
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			if tc.wantCode == http.StatusOK && resp.Data != nil {
-				data, ok := resp.Data.(map[string]interface{})
-				if !ok {
-					t.Fatalf("data is not a map: %v", resp.Data)
-				}
-				if gotExists, ok := data["exists"]; !ok || gotExists.(bool) != tc.wantExists {
-					t.Errorf("data.exists = %v, want %v", gotExists, tc.wantExists)
-				}
-			}
-		})
+	if _, err := readCommand(r); !errors.Is(err, io.EOF) {
+		t.Errorf("after both commands: got %v, want io.EOF", err)
 	}
 }
 
-func TestDeleteValueHandler(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Dispatcher tests
+// ---------------------------------------------------------------------------
+
+func TestDispatch(t *testing.T) {
 	tests := []struct {
-		name         string
-		method       string
-		key          string
-		prePopulate  map[string][]byte
-		wantCode     int
-		wantStatus   string
-		wantJSONCode string
-		verifyKey    string
-		verifyExists bool
+		name string
+		args []string
+		want Reply
 	}{
-		{"delete_existing_key", http.MethodDelete, "foo", map[string][]byte{"foo": []byte("bar")}, 200, "ok", "DELETE_OK", "foo", false},
-		{"delete_missing_key", http.MethodDelete, "nope", map[string][]byte{}, 200, "ok", "DELETE_OK", "nope", false},
-		{"delete_wrong_method", http.MethodPost, "", map[string][]byte{}, 405, "error", "METHOD_NOT_ALLOWED", "", true},
-		{"delete_empty_key", http.MethodDelete, "", map[string][]byte{"": []byte("val")}, 400, "error", "MISSING_KEY", "", false},
-		{"delete_then_verify_absent", http.MethodDelete, "x", map[string][]byte{"x": []byte("data")}, 200, "ok", "DELETE_OK", "x", false},
+		{"empty", []string{}, errReply("ERR empty command")},
+		{"set_too_few", []string{"set"}, errReply("ERR wrong number of arguments for 'SET' command")},
+		{"get_too_few", []string{"GET"}, errReply("ERR wrong number of arguments for 'GET' command")},
+		{"get_too_many", []string{"GET", "a", "b"}, errReply("ERR wrong number of arguments for 'GET' command")},
+		{"unknown", []string{"FOO"}, errReply("ERR unknown command 'FOO'")},
+		{"get_missing", []string{"get", "k"}, nullReply()},
+		{"set_lowercase", []string{"SeT", "k", "v"}, simpleString("OK")},
+		{"ping", []string{"PING"}, simpleString("PONG")},
+		{"ping_echo", []string{"PING", "hi"}, bulkReply([]byte("hi"))},
+		{"quit", []string{"QUIT"}, simpleString("OK")},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
-			populateStore(s, tc.prePopulate)
-
-			url := "/cache/delete?key=" + tc.key
-			req := httptest.NewRequest(tc.method, url, nil)
-			w := httptest.NewRecorder()
-
-			s.deleteValueHandler(w, req)
-
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if resp.Code != tc.wantJSONCode {
-				t.Errorf("code field = %q, want %q", resp.Code, tc.wantJSONCode)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			if tc.verifyKey != "" {
-				_, exists := s.Get(tc.verifyKey)
-				if exists != tc.verifyExists {
-					t.Errorf("Get(%q) exists = %v after Delete, want %v", tc.verifyKey, exists, tc.verifyExists)
-				}
+			got := dispatch(newTestStore(), tc.args)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %+v, want %+v", got, tc.want)
 			}
 		})
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Health check handler tests
+// Handler tests (store state)
 // ---------------------------------------------------------------------------
 
-func TestHealthHandler(t *testing.T) {
-	tests := []struct {
-		name       string
-		method     string
-		wantCode   int
-		wantStatus string
-		wantJSON   string
-	}{
-		{"health_valid_get", http.MethodGet, 200, "ok", "HEALTH_OK"},
-		{"health_wrong_method_post", http.MethodPost, 405, "error", "METHOD_NOT_ALLOWED"},
-		{"health_wrong_method_put", http.MethodPut, 405, "error", "METHOD_NOT_ALLOWED"},
-	}
+func TestCommandHandlers(t *testing.T) {
+	t.Run("set_then_get", func(t *testing.T) {
+		s := newTestStore()
+		if got := dispatch(s, []string{"SET", "foo", "bar"}); !reflect.DeepEqual(got, simpleString("OK")) {
+			t.Fatalf("SET reply = %+v", got)
+		}
+		if got := dispatch(s, []string{"GET", "foo"}); !reflect.DeepEqual(got, bulkReply([]byte("bar"))) {
+			t.Fatalf("GET reply = %+v", got)
+		}
+	})
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
+	t.Run("get_missing", func(t *testing.T) {
+		s := newTestStore()
+		if got := dispatch(s, []string{"GET", "nope"}); !reflect.DeepEqual(got, nullReply()) {
+			t.Errorf("GET reply = %+v, want null", got)
+		}
+	})
 
-			req := httptest.NewRequest(tc.method, "/health", nil)
-			w := httptest.NewRecorder()
-			s.healthHandler(w, req)
+	t.Run("del_counts", func(t *testing.T) {
+		s := newTestStore()
+		s.Set("a", []byte("1"))
+		s.Set("b", []byte("2"))
+		if got := dispatch(s, []string{"DEL", "a", "b", "c"}); !reflect.DeepEqual(got, intReply(2)) {
+			t.Errorf("DEL reply = %+v, want :2", got)
+		}
+		if got := dispatch(s, []string{"DEL", "a"}); !reflect.DeepEqual(got, intReply(0)) {
+			t.Errorf("second DEL reply = %+v, want :0", got)
+		}
+	})
 
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if resp.Code != tc.wantJSON {
-				t.Errorf("code field = %q, want %q", resp.Code, tc.wantJSON)
-			}
-		})
-	}
-}
-
-func TestReadyHandler(t *testing.T) {
-	tests := []struct {
-		name       string
-		method     string
-		wantCode   int
-		wantStatus string
-		wantJSON   string
-	}{
-		{"ready_store_healthy", http.MethodGet, 200, "ok", "READY"},
-		{"ready_wrong_method_post", http.MethodPost, 405, "error", "METHOD_NOT_ALLOWED"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
-
-			req := httptest.NewRequest(tc.method, "/health/ready", nil)
-			w := httptest.NewRecorder()
-			s.readyHandler(w, req)
-
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if resp.Code != tc.wantJSON {
-				t.Errorf("code field = %q, want %q", resp.Code, tc.wantJSON)
-			}
-		})
-	}
+	t.Run("exists_counts", func(t *testing.T) {
+		s := newTestStore()
+		s.Set("a", []byte("1"))
+		s.Set("b", []byte("2"))
+		if got := dispatch(s, []string{"EXISTS", "a", "c", "b"}); !reflect.DeepEqual(got, intReply(2)) {
+			t.Errorf("EXISTS reply = %+v, want :2", got)
+		}
+	})
 
 	t.Run("ready_cleanup", func(t *testing.T) {
 		s := newTestStore()
-		req := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
-		w := httptest.NewRecorder()
-		s.readyHandler(w, req)
-
-		if w.Code != http.StatusOK {
-			t.Fatalf("status = %d, want 200", w.Code)
+		if got := dispatch(s, []string{"READY"}); !reflect.DeepEqual(got, simpleString("READY")) {
+			t.Fatalf("READY reply = %+v", got)
 		}
-
 		s.mu.RLock()
 		defer s.mu.RUnlock()
 		for k := range s.value.data {
 			if strings.HasPrefix(k, "_health_check_") {
 				t.Errorf("orphaned health key %q left in store", k)
 			}
-		}
-	})
-}
-
-func TestMissingQueryParameter(t *testing.T) {
-	tests := []struct {
-		name       string
-		handler    string
-		method     string
-		wantCode   int
-		wantStatus string
-		wantJSON   string
-	}{
-		{"set_missing_key_param", "set", http.MethodPost, 400, "error", "MISSING_KEY"},
-		{"get_missing_key_param", "get", http.MethodGet, 400, "error", "MISSING_KEY"},
-		{"exists_missing_key_param", "exists", http.MethodGet, 400, "error", "MISSING_KEY"},
-		{"delete_missing_key_param", "delete", http.MethodDelete, 400, "error", "MISSING_KEY"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			s := newTestStore()
-
-			var url string
-			switch tc.handler {
-			case "set":
-				url = "/cache/set"
-			case "get":
-				url = "/cache/get"
-			case "exists":
-				url = "/cache/exists"
-			case "delete":
-				url = "/cache/delete"
-			}
-
-			var req *http.Request
-			if tc.method == http.MethodPost {
-				req = httptest.NewRequest(tc.method, url, nil)
-			} else {
-				req = httptest.NewRequest(tc.method, url, nil)
-			}
-
-			w := httptest.NewRecorder()
-
-			switch tc.handler {
-			case "set":
-				s.setValueHandler(w, req)
-			case "get":
-				s.getValueHandler(w, req)
-			case "exists":
-				s.existsValueHandler(w, req)
-			case "delete":
-				s.deleteValueHandler(w, req)
-			}
-
-			if w.Code != tc.wantCode {
-				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
-			}
-			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
-				t.Errorf("Content-Type = %q, want application/json", ct)
-			}
-
-			resp := parseResponse(t, w)
-			if resp.Status != tc.wantStatus {
-				t.Errorf("status field = %q, want %q", resp.Status, tc.wantStatus)
-			}
-			if resp.Code != tc.wantJSON {
-				t.Errorf("code field = %q, want %q", resp.Code, tc.wantJSON)
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Phase 3: Integration test
-// ---------------------------------------------------------------------------
-
-func TestIntegrationEndToEnd(t *testing.T) {
-	store := newTestStore()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/cache/get", store.getValueHandler)
-	mux.HandleFunc("/cache/set", store.setValueHandler)
-	mux.HandleFunc("/cache/delete", store.deleteValueHandler)
-	mux.HandleFunc("/cache/exists", store.existsValueHandler)
-	mux.HandleFunc("/health", store.healthHandler)
-	mux.HandleFunc("/health/ready", store.readyHandler)
-
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-
-	postSet := func(key, value string) (*http.Response, error) {
-		body := strings.NewReader("key=" + key + "&value=" + value)
-		return http.Post(ts.URL+"/cache/set", "application/x-www-form-urlencoded", body)
-	}
-
-	t.Run("e2e_set_and_get", func(t *testing.T) {
-		resp, err := postSet("hello", "world")
-		if err != nil {
-			t.Fatalf("POST /cache/set failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 200 {
-			t.Errorf("POST /cache/set status = %d, want 200", resp.StatusCode)
-		}
-		if r.Code != "SET_OK" {
-			t.Errorf("POST /cache/set code = %q, want SET_OK", r.Code)
-		}
-
-		val, ok := store.Get("hello")
-		if !ok {
-			t.Fatal("store.Get(\"hello\") exists = false after POST")
-		}
-		if string(val) != "world" {
-			t.Errorf("store.Get(\"hello\") = %q, want %q", val, "world")
-		}
-	})
-
-	t.Run("e2e_get_missing", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/cache/get?key=nonexistent")
-		if err != nil {
-			t.Fatalf("GET /cache/get failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 404 {
-			t.Errorf("GET /cache/get status = %d, want 404", resp.StatusCode)
-		}
-		if r.Code != "NOT_FOUND" {
-			t.Errorf("GET /cache/get code = %q, want NOT_FOUND", r.Code)
-		}
-	})
-
-	t.Run("e2e_exists_present", func(t *testing.T) {
-		postSet("k", "v")
-
-		resp, err := http.Get(ts.URL + "/cache/exists?key=k")
-		if err != nil {
-			t.Fatalf("GET /cache/exists failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 200 {
-			t.Errorf("GET /cache/exists status = %d, want 200", resp.StatusCode)
-		}
-		if r.Code != "EXISTS_OK" {
-			t.Errorf("GET /cache/exists code = %q, want EXISTS_OK", r.Code)
-		}
-		data, ok := r.Data.(map[string]interface{})
-		if !ok {
-			t.Fatalf("data is not a map: %v", r.Data)
-		}
-		if exists, ok := data["exists"]; !ok || exists.(bool) != true {
-			t.Errorf("data.exists = %v, want true", exists)
-		}
-	})
-
-	t.Run("e2e_exists_absent", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/cache/exists?key=absent-key")
-		if err != nil {
-			t.Fatalf("GET /cache/exists failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 404 {
-			t.Errorf("GET /cache/exists status = %d, want 404", resp.StatusCode)
-		}
-		if r.Code != "NOT_FOUND" {
-			t.Errorf("GET /cache/exists code = %q, want NOT_FOUND", r.Code)
-		}
-	})
-
-	t.Run("e2e_delete_and_verify", func(t *testing.T) {
-		postSet("del-me", "data")
-
-		exists, _ := store.Exists("del-me")
-		if !exists {
-			t.Fatal("key \"del-me\" should exist after SET")
-		}
-
-		req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/cache/delete?key=del-me", nil)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("DELETE /cache/delete failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 200 {
-			t.Errorf("DELETE /cache/delete status = %d, want 200", resp.StatusCode)
-		}
-		if r.Code != "DELETE_OK" {
-			t.Errorf("DELETE /cache/delete code = %q, want DELETE_OK", r.Code)
-		}
-
-		exists, _ = store.Exists("del-me")
-		if exists {
-			t.Error("key \"del-me\" should be absent after DELETE")
-		}
-	})
-
-	t.Run("e2e_set_wrong_method", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/cache/set")
-		if err != nil {
-			t.Fatalf("GET /cache/set failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 405 {
-			t.Errorf("GET /cache/set status = %d, want 405", resp.StatusCode)
-		}
-		if r.Code != "METHOD_NOT_ALLOWED" {
-			t.Errorf("GET /cache/set code = %q, want METHOD_NOT_ALLOWED", r.Code)
-		}
-	})
-
-	t.Run("e2e_overwrite", func(t *testing.T) {
-		postSet("k", "old")
-		postSet("k", "new")
-
-		val, ok := store.Get("k")
-		if !ok {
-			t.Fatal("store.Get(\"k\") exists = false after overwrite")
-		}
-		if string(val) != "new" {
-			t.Errorf("store.Get(\"k\") = %q, want %q", val, "new")
-		}
-	})
-
-	t.Run("e2e_health", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/health")
-		if err != nil {
-			t.Fatalf("GET /health failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 200 {
-			t.Errorf("GET /health status = %d, want 200", resp.StatusCode)
-		}
-		if r.Code != "HEALTH_OK" {
-			t.Errorf("GET /health code = %q, want HEALTH_OK", r.Code)
-		}
-		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-			t.Errorf("GET /health Content-Type = %q, want application/json", ct)
-		}
-	})
-
-	t.Run("e2e_ready", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/health/ready")
-		if err != nil {
-			t.Fatalf("GET /health/ready failed: %v", err)
-		}
-		r := parseHTTPResponse(t, resp)
-		if resp.StatusCode != 200 {
-			t.Errorf("GET /health/ready status = %d, want 200", resp.StatusCode)
-		}
-		if r.Code != "READY" {
-			t.Errorf("GET /health/ready code = %q, want READY", r.Code)
-		}
-		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
-			t.Errorf("GET /health/ready Content-Type = %q, want application/json", ct)
 		}
 	})
 }

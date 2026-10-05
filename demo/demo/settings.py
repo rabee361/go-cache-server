@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -25,7 +26,7 @@ SECRET_KEY = 'django-insecure-3^70ha7-!xu-0%2-#6onh+%l1(mjd!uo5r7if72tvrl8h(z!+%
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ["*"]
 
 
 # Application definition
@@ -40,12 +41,12 @@ INSTALLED_APPS = [
     'base',
     'rest_framework',
     'debug_toolbar',
-
 ]
 
 INTERNAL_IPS = [
     "127.0.0.1",
     "localhost",
+    "172.18.0.0/16",
 ]
 
 MIDDLEWARE = [
@@ -78,8 +79,8 @@ TEMPLATES = [
 
 CACHES = {
     "default": {
-        "BACKEND": "demo.backends.GoCacheBackend",
-        "LOCATION": "http://localhost:8080",
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
     }
 }
 
