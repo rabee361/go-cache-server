@@ -2,3 +2,6 @@
 .venv/
 __pacache__/
 *.pyc
+.sqlite3
+db.sqlite3
+*.exe

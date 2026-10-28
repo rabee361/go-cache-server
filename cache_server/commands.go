@@ -10,11 +10,9 @@ import (
 
 type commandHandler func(store Store, state *clientState, args []string) Reply
 
-// clientState is per-connection state: the negotiated RESP protocol version
-// (2 by default, switched by HELLO) and a unique connection id.
 type clientState struct {
 	protocol_version int
-	id    int64
+	id               int64
 }
 
 var connIDCounter atomic.Int64
@@ -130,7 +128,7 @@ func helloReply(state *clientState) Reply {
 	return mapReply([]Reply{
 		bulkReply([]byte("server")), bulkReply([]byte("cache-server")),
 		bulkReply([]byte("version")), bulkReply([]byte("0.1.0")),
-		bulkReply([]byte("protocol_version")), intReply(int64(state.protocol_version)),
+		bulkReply([]byte("proto")), intReply(int64(state.protocol_version)),
 		bulkReply([]byte("id")), intReply(state.id),
 		bulkReply([]byte("mode")), bulkReply([]byte("standalone")),
 		bulkReply([]byte("role")), bulkReply([]byte("master")),

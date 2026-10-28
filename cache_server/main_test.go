@@ -266,7 +266,7 @@ func TestConcurrentAccess(t *testing.T) {
 func TestWriteReply(t *testing.T) {
 	tests := []struct {
 		name  string
-		proto int
+		protocol_version int
 		in    Reply
 		want  string
 	}{
@@ -289,13 +289,13 @@ func TestWriteReply(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			proto := tc.proto
-			if proto == 0 {
-				proto = 2
+			protocol_version := tc.protocol_version
+			if protocol_version == 0 {
+				protocol_version = 2
 			}
 			var buf bytes.Buffer
 			w := bufio.NewWriter(&buf)
-			if err := writeReply(w, proto, tc.in); err != nil {
+			if err := writeReply(w, protocol_version, tc.in); err != nil {
 				t.Fatalf("writeReply: %v", err)
 			}
 			if err := w.Flush(); err != nil {
@@ -451,38 +451,38 @@ func TestDispatch(t *testing.T) {
 
 func TestHelloDispatch(t *testing.T) {
 	s := newTestStore()
-	st := newClientState()
+	state := newClientState()
 
 	// HELLO with no args replies in the current protocol and does not switch it
-	if got := dispatch(s, st, []string{"HELLO"}); !reflect.DeepEqual(got, helloReply(st)) {
-		t.Errorf("HELLO reply = %+v, want %+v", got, helloReply(st))
+	if got := dispatch(s, state, []string{"HELLO"}); !reflect.DeepEqual(got, helloReply(state)) {
+		t.Errorf("HELLO reply = %+v, want %+v", got, helloReply(state))
 	}
-	if st.proto != 2 {
-		t.Errorf("proto after bare HELLO = %d, want 2", st.proto)
+	if state.protocol_version != 2 {
+		t.Errorf("protocol_version after bare HELLO = %d, want 2", state.protocol_version)
 	}
 
 	// HELLO 3 switches the connection to RESP3 and replies with a map
-	if got := dispatch(s, st, []string{"HELLO", "3"}); !reflect.DeepEqual(got, helloReply(st)) {
-		t.Errorf("HELLO 3 reply = %+v, want %+v", got, helloReply(st))
+	if got := dispatch(s, state, []string{"HELLO", "3"}); !reflect.DeepEqual(got, helloReply(state)) {
+		t.Errorf("HELLO 3 reply = %+v, want %+v", got, helloReply(state))
 	}
-	if st.proto != 3 {
-		t.Errorf("proto after HELLO 3 = %d, want 3", st.proto)
+	if state.protocol_version != 3 {
+		t.Errorf("protocol_version after HELLO 3 = %d, want 3", state.protocol_version)
 	}
 
 	// HELLO 2 switches back to RESP2
-	if got := dispatch(s, st, []string{"HELLO", "2"}); !reflect.DeepEqual(got, helloReply(st)) {
-		t.Errorf("HELLO 2 reply = %+v, want %+v", got, helloReply(st))
+	if got := dispatch(s, state, []string{"HELLO", "2"}); !reflect.DeepEqual(got, helloReply(state)) {
+		t.Errorf("HELLO 2 reply = %+v, want %+v", got, helloReply(state))
 	}
-	if st.proto != 2 {
-		t.Errorf("proto after HELLO 2 = %d, want 2", st.proto)
+	if state.protocol_version != 2 {
+		t.Errorf("protocol_version after HELLO 2 = %d, want 2", state.protocol_version)
 	}
 
 	// rejected HELLO must not change the protocol
-	if got := dispatch(s, st, []string{"HELLO", "3", "AUTH", "default", "secret"}); got.Kind != '-' {
+	if got := dispatch(s, state, []string{"HELLO", "3", "AUTH", "default", "secret"}); got.Kind != '-' {
 		t.Errorf("HELLO AUTH reply = %+v, want an error", got)
 	}
-	if st.proto != 2 {
-		t.Errorf("proto after rejected HELLO = %d, want 2 (unchanged)", st.proto)
+	if state.protocol_version != 2 {
+		t.Errorf("protocol_version after rejected HELLO = %d, want 2 (unchanged)", state.protocol_version)
 	}
 }
 
@@ -493,11 +493,11 @@ func TestHelloDispatch(t *testing.T) {
 func TestCommandHandlers(t *testing.T) {
 	t.Run("set_then_get", func(t *testing.T) {
 		s := newTestStore()
-		st := newClientState()
-		if got := dispatch(s, st, []string{"SET", "foo", "bar"}); !reflect.DeepEqual(got, simpleString("OK")) {
+		state := newClientState()
+		if got := dispatch(s, state, []string{"SET", "foo", "bar"}); !reflect.DeepEqual(got, simpleString("OK")) {
 			t.Fatalf("SET reply = %+v", got)
 		}
-		if got := dispatch(s, st, []string{"GET", "foo"}); !reflect.DeepEqual(got, bulkReply([]byte("bar"))) {
+		if got := dispatch(s, state, []string{"GET", "foo"}); !reflect.DeepEqual(got, bulkReply([]byte("bar"))) {
 			t.Fatalf("GET reply = %+v", got)
 		}
 	})

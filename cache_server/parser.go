@@ -103,7 +103,6 @@ func readCommand(reader *bufio.Reader) ([]string, error) {
 		fmt.Println("Inline command received", first[0])
 		return readInline(reader)
 	}
-	fmt.Println("Array command received", first)
 	return readArray(reader)
 }
 

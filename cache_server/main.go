@@ -95,7 +95,7 @@ func handleConn(conn net.Conn, store *MemoryStore) {
 		}
 	}()
 
-	st := newClientState()
+	state := newClientState()
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
@@ -109,8 +109,8 @@ func handleConn(conn net.Conn, store *MemoryStore) {
 			return
 		}
 
-		reply := dispatch(store, st, args)
-		writeReply(writer, st.proto, reply)
+		reply := dispatch(store, state, args)
+		writeReply(writer, state.protocol_version, reply)
 		writer.Flush()
 	}
 }

@@ -4,5 +4,7 @@ from .views import *
 
 
 urlpatterns = [
-    path('posts/', PostView.as_view())
+    path('api/posts/', PostView.as_view()),
+    path('posts/simple/', PostsSimpleView.as_view(), name='posts_simple'),
+    path('posts/paginated/', PostsPaginatedView.as_view(), name='posts_paginated'),
 ]
