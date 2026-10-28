@@ -6,72 +6,78 @@ import (
 	"flag"
 	"io"
 	"log"
+	"math"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
 
 type Store interface {
 	Get(key string) ([]byte, bool)
-	Set(key string, value []byte) (uint64, error)
+	Set(key string, value []byte, ttlMs int64) error
 	Delete(key string) (uint64, error)
-	Exists(key string) (bool, error)
 }
 
 var _ Store = (*MemoryStore)(nil)
 
-type StoreValue struct {
-	data      map[string][]byte
-	timestamp time.Time
+type entry struct {
+	value     []byte
+	expiresAt int64
+}
+
+func (e entry) expired(now int64) bool {
+	return e.expiresAt > 0 && e.expiresAt <= now
 }
 
 type MemoryStore struct {
-	mu    sync.RWMutex
-	value StoreValue
+	mu   sync.RWMutex
+	data map[string]entry
 }
 
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{
-		mu:    sync.RWMutex{},
-		value: StoreValue{data: make(map[string][]byte)},
+	return &MemoryStore{data: make(map[string]entry)}
+}
+
+func (s *MemoryStore) Set(key string, value []byte, ttlMs int64) error {
+	now := time.Now().UnixMilli()
+	e := entry{value: value}
+	if ttlMs > 0 {
+		if ttlMs > math.MaxInt64-now {
+			e.expiresAt = math.MaxInt64
+		} else {
+			e.expiresAt = now + ttlMs
+		}
 	}
-}
-
-func (s *MemoryStore) Set(key string, value []byte) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.value.data[key] = value
-	return 0, nil
+	s.data[key] = e
+	return nil
 }
 
-func (s *MemoryStore) Get(key string) ([]byte, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	value, exists := s.value.data[key]
-	return value, exists
+func (store *MemoryStore) Get(key string) ([]byte, bool) {
+	now := time.Now().UnixMilli()
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	entry, ok := store.data[key]
+	if !ok || entry.expired(now) {
+		return nil, false
+	}
+	return entry.value, true
 }
 
-func (s *MemoryStore) Delete(key string) (uint64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.value.data[key]; !exists {
+func (store *MemoryStore) Delete(key string) (uint64, error) {
+	now := time.Now().UnixMilli()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	e, exists := store.data[key]
+	if !exists || e.expired(now) {
 		return 0, nil
 	}
-	delete(s.value.data, key)
+	delete(store.data, key)
 	return 1, nil
 }
 
-func (s *MemoryStore) Exists(key string) (bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, exists := s.value.data[key]
-	return exists, nil
-}
-
-// serve accepts connections on ln until ln is closed. Each connection gets
-// its own goroutine so a slow client can never stall the others.
-func serve(listener net.Listener, store Store) error {
+func serve(listener net.Listener, store *MemoryStore) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -81,9 +87,7 @@ func serve(listener net.Listener, store Store) error {
 	}
 }
 
-// handleConn runs the read-decode-dispatch-encode-flush loop for one client
-// connection. All network I/O happens outside any store lock.
-func handleConn(conn net.Conn, store Store) {
+func handleConn(conn net.Conn, store *MemoryStore) {
 	defer conn.Close()
 	defer func() {
 		if p := recover(); p != nil {
@@ -91,6 +95,7 @@ func handleConn(conn net.Conn, store Store) {
 		}
 	}()
 
+	st := newClientState()
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
@@ -100,18 +105,13 @@ func handleConn(conn net.Conn, store Store) {
 			if errors.Is(err, io.EOF) {
 				return
 			}
-			writeReply(writer, errReply("ERR Protocol error: "+err.Error()))
 			writer.Flush()
 			return
 		}
 
-		reply := dispatch(store, args)
-		writeReply(writer, reply)
+		reply := dispatch(store, st, args)
+		writeReply(writer, st.proto, reply)
 		writer.Flush()
-
-		if reply.Kind == '+' && reply.Str == "OK" && strings.EqualFold(args[0], "QUIT") {
-			return
-		}
 	}
 }
 
@@ -123,6 +123,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen on %s: %v", *addr, err)
 	}
-	log.Printf("cache server listening on %s", *addr)
+	log.Printf("RESP cache server listening on %s", *addr)
 	log.Fatal(serve(listener, NewMemoryStore()))
 }

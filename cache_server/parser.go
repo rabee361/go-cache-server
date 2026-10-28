@@ -10,17 +10,17 @@ import (
 )
 
 const (
-	maxBulkLen = 1 << 20 // refuse bulk strings larger than 1 MB (DoS guard)
-	maxArgs    = 1024    // refuse commands with more than 1024 arguments
+	maxBulkLen = 1048576
+	maxArgs    = 1024
 )
 
-// Reply is a RESP reply value. Kind is one of '+', '-', ':', '$', '*'.
 type Reply struct {
-	Kind byte     // '+', '-', ':', '$', '*'
-	Str  string   // payload for '+', '-', '$'
-	Int  int64    // payload for ':'
-	Null bool     // true -> "$-1\r\n"
-	Arr  []Reply  // payload for '*'; this subset never emits arrays
+	Kind byte
+	Str  string
+	Int  int64
+	Null bool
+	Arr  []Reply
+	Map  []Reply // alternating key/value pairs; encoded per protocol ('%' or flat '*')
 }
 
 func simpleString(s string) Reply { return Reply{Kind: '+', Str: s} }
@@ -28,10 +28,14 @@ func errReply(msg string) Reply   { return Reply{Kind: '-', Str: msg} }
 func intReply(n int64) Reply      { return Reply{Kind: ':', Int: n} }
 func bulkReply(b []byte) Reply    { return Reply{Kind: '$', Str: string(b)} }
 func nullReply() Reply            { return Reply{Kind: '$', Null: true} }
+func arrayReply(elems []Reply) Reply {
+	return Reply{Kind: '*', Arr: elems}
+}
+func mapReply(entries []Reply) Reply {
+	return Reply{Kind: '%', Map: entries}
+}
 
-// writeReply serializes reader into writer in RESP format. It does NOT flush; flushing
-// is the connection loop's job so batching stays possible.
-func writeReply(writer *bufio.Writer, reader Reply) error {
+func writeReply(writer *bufio.Writer, proto int, reader Reply) error {
 	switch reader.Kind {
 	case '+', '-':
 		msg := strings.ReplaceAll(strings.ReplaceAll(reader.Str, "\r", " "), "\n", " ")
@@ -44,10 +48,12 @@ func writeReply(writer *bufio.Writer, reader Reply) error {
 		}
 	case '$':
 		if reader.Null {
-			if _, err := writer.WriteString("$-1\r\n"); err != nil {
+			if proto >= 3 {
+				_, err := writer.WriteString("_\r\n")
 				return err
 			}
-			return nil
+			_, err := writer.WriteString("$-1\r\n")
+			return err
 		}
 		if _, err := fmt.Fprintf(writer, "$%d\r\n", len(reader.Str)); err != nil {
 			return err
@@ -63,7 +69,22 @@ func writeReply(writer *bufio.Writer, reader Reply) error {
 			return err
 		}
 		for _, elem := range reader.Arr {
-			if err := writeReply(writer, elem); err != nil {
+			if err := writeReply(writer, proto, elem); err != nil {
+				return err
+			}
+		}
+	case '%':
+		if proto >= 3 {
+			if _, err := fmt.Fprintf(writer, "%%%d\r\n", len(reader.Map)/2); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintf(writer, "*%d\r\n", len(reader.Map)); err != nil {
+				return err
+			}
+		}
+		for _, elem := range reader.Map {
+			if err := writeReply(writer, proto, elem); err != nil {
 				return err
 			}
 		}
@@ -73,19 +94,16 @@ func writeReply(writer *bufio.Writer, reader Reply) error {
 	return nil
 }
 
-// readCommand reads one complete command from r. It accepts the RESP array
-// form (*<n> followed by n bulk strings) and the inline form (a plain text
-// line split on whitespace). It returns io.EOF when the connection was closed
-// cleanly before any bytes of a new command arrived; any other error is a
-// protocol violation.
 func readCommand(reader *bufio.Reader) ([]string, error) {
 	first, err := reader.Peek(1)
 	if err != nil {
 		return nil, err
 	}
 	if first[0] != '*' {
+		fmt.Println("Inline command received", first[0])
 		return readInline(reader)
 	}
+	fmt.Println("Array command received", first)
 	return readArray(reader)
 }
 

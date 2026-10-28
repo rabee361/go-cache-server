@@ -1,6 +1,6 @@
 # Architecture decisions — go-cache-server
 
-This document walks through the reasoning behind each architectural decision in the HTTP/JSON → RESP refactor. Each section states the decision, the chain of logic that led to it, and the alternative that was rejected.
+This document walks through the reasoning behind each architectural decision in the HTTP/JSON → RESP refactor, and later the minimal-scope trim. Each section states the decision, the chain of logic that led to it, and the alternative that was rejected. Sections describing features that no longer exist are annotated as removed with a pointer to §24, the trim rationale.
 
 ## 1. Speak RESP instead of HTTP/JSON
 
@@ -166,6 +166,8 @@ This document walks through the reasoning behind each architectural decision in 
 
 ## 15. `QUIT` is handled in `handleConn`, not in the handler
 
+> **Removed in the minimal-scope trim (§24)** — `QUIT` is no longer a command; clients simply close the connection, and `handleConn` returns on `io.EOF`.
+
 **Decision:** `cmdQuit` just returns `+OK`; the connection loop closes the connection when it sees a successful `QUIT` reply.
 
 **Logic steps:**
@@ -193,9 +195,11 @@ This document walks through the reasoning behind each architectural decision in 
 2. A client claiming `$999999999` would make the server allocate a gigabyte — or die trying.
 3. A cap turns that into a cheap error reply and connection close. 1 MB is far beyond any realistic cache value here; the test suite already exercises 1 MB values as a boundary.
 
-## 18. Keeping `READY` as a documented non-standard command
+## 18. `READY` as a non-standard command (removed)
 
-**Decision:** port the old `/health/ready` self-test to a `READY` command instead of dropping it.
+> **Removed in the minimal-scope trim (§24).** The decision below was valid for the earlier, broader build; the trimmed server has no `PING` to fall back on either, and health checks are out of scope until commands are grown back.
+
+**Decision (historical):** port the old `/health/ready` self-test to a `READY` command instead of dropping it.
 
 **Logic steps:**
 
@@ -253,8 +257,33 @@ This document walks through the reasoning behind each architectural decision in 
 2. The arity table (§9) already makes handler panics unrepresentable, but the guard is cheap insurance at the one boundary that touches attacker-controlled input.
 3. Scoping it per-connection means a hypothetical panic costs one client, not the fleet.
 
+## 24. Minimal scope: four commands for Django queryset caching
+
+**Decision:** the server implements exactly `SET (EX/PX)`, `GET`, `DEL`, and `CLIENT SETINFO`; everything else (PING, SETEX/PSETEX, NX/XX, MGET/MSET, INCR family, EXPIRE/TTL, FLUSHDB, SCAN, SELECT, EXISTS, QUIT, READY, multiple logical DBs, the glob matcher) was removed.
+
+**Logic steps:**
+
+1. The server exists to back one Django demo view that calls `cache.get`/`cache.set` through Django's built-in `RedisCache` (redis-py). On `redis://localhost:6379/0` that client sends only: `CLIENT SETINFO` (twice per connection, redis-py ≥ 5), `GET`, and `SET key value EX 300`. Every other command was speculative surface area.
+2. `DEL` stays so a bad cached value can be cleared manually during testing — it is variadic, so Django's `delete`/`delete_many` keep working too.
+3. Shrinking the `Store` interface to three methods (`Get`, `Set`, `Delete`) collapsed the session/DB indirection into a single map — the session abstraction existed only to carry `SELECT` state, and with `SELECT` gone the store **is** the session.
+4. Redis error strings are preserved verbatim (`ERR syntax error`, `ERR invalid expire time in 'set' command`, `ERR unknown command`, arity wording, CLIENT subcommand wording) so real clients report the failures they expect, and tests pin them.
+5. Protocol errors close the connection **silently** — no `-ERR Protocol error:` reply is written. Command errors still get replies; only malformed framing kills the connection (this was a deliberate hand edit, kept as-is).
+6. Cost of the trim: Django features beyond get/set (`get_many`, `set_many`, `incr`, `touch`, `clear`) now error with "unknown command", non-zero DB URLs fail on `SELECT`, and there is no `PING` for health checks.
+
+## 25. `HELLO` negotiates RESP3 per connection
+
+**Decision:** add `HELLO [2|3]`; the negotiated protocol is per-connection state, not global, and the reply encoder consults it on every write.
+
+**Logic steps:**
+
+1. RESP3 is a superset where the wire form of a reply depends on the negotiated version: a missing `GET` is `$-1\r\n` in RESP2 but `_\r\n` in RESP3, and `HELLO`'s server info is a flat array in RESP2 but a map (`%7`) in RESP3. One `Reply` value must therefore be *version-agnostic*: null stays a null bulk (`Kind: '$'` with `Null`), and the server info is stored as alternating key/value pairs (`Kind: '%'`). The encoder decides the wire form from the `proto` argument.
+2. The protocol version is **connection state** (redis-py sends `HELLO 3` once after connect), so it lives in a `clientState` alongside a unique connection id. `cmdHello` mutates it; `handleConn` reads `st.proto` *after* dispatch, so the switch takes effect on the `HELLO` reply itself — exactly how Redis behaves.
+3. The connection id comes from a package-level `atomic` counter, so the map's `id` field is stable and unique per connection without a connection registry.
+4. `HELLO 4` (or junk) replies Redis's exact `NOPROTO unsupported protocol version` and leaves the protocol unchanged — errors must not have side effects.
+5. Options are rejected honestly: `AUTH` returns Redis's no-password error (there is no auth), `SETNAME` errors as unsupported (there is no client-name registry). Silently accepting either would be lying to the client.
+6. The server-info reply mirrors Redis's seven fields (`server`, `version`, `proto`, `id`, `mode`, `role`, `modules`) with honest values, and `modules` is the empty array — redis-py parses all of them.
+
 ## Deferred / out of scope
 
-- **Migrating `demo/demo/go_client.py` + `backends.py`** to a RESP client (e.g. `redis-py`, wire-compatible with this subset). The demo's `django-redis` path via `REDIS_URL` is unaffected.
-- **Full Redis**: persistence, TTL/EXPIRE, `SELECT`/DBs, `MGET`/`MSET`, pub/sub, `MULTI`, RESP3, AUTH, clustering.
+- **Growing the command set back** — string commands, data types, the expiry engine, persistence, replication, the rest of RESP3 (sets, doubles, booleans, verbatim strings, push messages) are all deferred.
 - **Hardening**: idle-connection read deadlines, graceful shutdown on SIGINT, filling in the empty `cache_server/dockerfile`.
