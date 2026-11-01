@@ -16,6 +16,8 @@ type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte, ttlMs int64) error
 	Delete(key string) (uint64, error)
+	Exists(key string) (uint64, error)
+	FlushDB() error
 }
 
 var _ Store = (*MemoryStore)(nil)
@@ -75,6 +77,24 @@ func (store *MemoryStore) Delete(key string) (uint64, error) {
 	}
 	delete(store.data, key)
 	return 1, nil
+}
+
+func (store *MemoryStore) Exists(key string) (uint64, error) {
+	now := time.Now().UnixMilli()
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	e, exists := store.data[key]
+	if !exists || e.expired(now) {
+		return 0, nil
+	}
+	return 1, nil
+}
+
+func (store *MemoryStore) FlushDB() error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	clear(store.data)
+	return nil
 }
 
 func serve(listener net.Listener, store *MemoryStore) error {

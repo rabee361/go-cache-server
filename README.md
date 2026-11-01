@@ -11,14 +11,17 @@ The server is intentionally minimal: it implements exactly what a Django project
 | `SET` | `SET key value [EX sec\|PX ms]` | `+OK` |
 | `GET` | `GET key` | bulk string, or null (`$-1` in RESP2, `_` in RESP3) if missing/expired |
 | `DEL` | `DEL key [key ...]` | `:<count>` — number of keys actually removed |
+| `EXISTS` | `EXISTS key [key ...]` | `:<count>` — expired keys count as absent |
+| `FLUSHDB` | `FLUSHDB` | `+OK` — clears every key in the store |
 | `HELLO` | `HELLO [2\|3]` | server info (flat array in RESP2, map in RESP3); `HELLO 3` switches the connection to RESP3 |
 | `CLIENT` | `CLIENT SETINFO lib-name lib-ver` | `+OK` — accepts the redis-py handshake |
+| `PING` | `PING [message]` | `+PONG`, or the message echoed back as a bulk string |
 
 Commands are case-insensitive. Both RESP array framing (what real clients send) and inline commands (what you type into `nc`/telnet: `SET foo bar`) are accepted. `CLIENT SETINFO` is required because redis-py ≥ 5 sends it twice on every connect; it accepts any arguments and does nothing.
 
-**Protocols:** connections start in RESP2 (the default). `HELLO 3` switches a single connection to RESP3 — reply encoding changes for that connection only: null bulk strings become `_` and `HELLO` replies become maps (`%7`). `HELLO 2` switches back. `HELLO 4` (or junk) replies Redis's exact `NOPROTO unsupported protocol version` without changing the protocol. `HELLO ... AUTH` fails because no password is configured; `SETNAME` is not supported.
+**Protocols:** connections start in RESP2 (the default). `HELLO 3` switches a single connection to RESP3 — reply encoding changes for that connection only: null bulk strings become `_` and `HELLO` replies become maps (`%7`). `HELLO 2` switches back. `HELLO 4` (or junk) replies Redis's exact `NOPROTO unsupported protocol version` without changing the protocol. AUTH matches real Redis with no requirepass configured: the default user is nopass, so `HELLO <proto> AUTH default <anything>` succeeds, other usernames reply `WRONGPASS`, and incomplete AUTH or unsupported options (like `SETNAME`) reply Redis's `Syntax error in HELLO option '...'`.
 
-**Not implemented (intentionally):** `PING`, `SETEX`/`PSETEX`, `NX`/`XX`, `MSET`/`MGET`, `INCR` family, `EXPIRE`/`TTL`, `FLUSHDB`, `SCAN`, `SELECT`, `EXISTS`, `QUIT`, persistence, active expiry, eviction, RESP3 beyond maps/nulls (sets, doubles, booleans, verbatim strings, push messages).
+**Not implemented (intentionally):** `SETEX`/`PSETEX`, `NX`/`XX`, `MSET`/`MGET`, `INCR` family, `EXPIRE`/`TTL`, `SCAN`, `SELECT`, `QUIT`, persistence, active expiry, eviction, RESP3 beyond maps/nulls (sets, doubles, booleans, verbatim strings, push messages).
 
 ## Run it
 
@@ -51,7 +54,7 @@ Supported in the demo with this build:
 
 Optional RESP3: point the demo at `redis://localhost:6379/0?protocol=3` — redis-py will send `HELLO 3` on connect and the server replies in RESP3 (missing keys come back as `_` instead of `$-1`).
 
-Will raise errors against this build (commands removed): `cache.get_many`/`set_many` (MSET/MGET), `cache.incr`/`decr` (INCR), `cache.touch` (EXPIRE), `cache.clear` (SCAN+DEL or FLUSHDB), and `cache.delete_many` still works (DEL is variadic) — as does `cache.delete` (DEL).
+Will raise errors against this build (commands removed): `cache.get_many`/`set_many` (MSET/MGET), `cache.incr`/`decr` (INCR), `cache.touch` (EXPIRE), `cache.add`/`get_or_set` (SET NX), and `cache.delete_many` still works (DEL is variadic) — as does `cache.delete` (DEL), `cache.has_key` (EXISTS), and `cache.clear` (FLUSHDB).
 
 The old HTTP/JSON demo client (`go_client.py`) and its custom cache backend (`backends.py`) were deleted along with the HTTP API. Also note: the demo view in `demo/base/views.py` caches a lazy QuerySet, so a cache hit still evaluates against the database unless the queryset is serialized first — worth fixing when you test.
 
@@ -64,6 +67,7 @@ The old HTTP/JSON demo client (`go_client.py`) and its custom cache backend (`ba
 | `cache_server/commands.go` | Command/arity table, `dispatch`, per-command handlers |
 | `cache_server/main_test.go` | Store unit tests + codec/dispatch/handler tests |
 | `cache_server/e2e_test.go` | Raw-socket end-to-end tests asserting exact wire bytes |
+| `cache_server/IMPLEMENTATION_GUIDE.md` | Learning guide: step-by-step implementation plans for EXEC/MULTI, the SET options refactor, and GET extensions |
 | `docs.md` | Rationale behind the architectural decisions |
 
 ## Testing

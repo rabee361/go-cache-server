@@ -29,11 +29,14 @@ type commandSpec struct {
 }
 
 var commandTable = map[string]commandSpec{
-	"SET":    {"SET", 3, -1, cmdSet},
-	"GET":    {"GET", 2, 2, cmdGet},
-	"DEL":    {"DEL", 2, -1, cmdDel},
-	"HELLO":  {"HELLO", 1, -1, cmdHello},
-	"CLIENT": {"CLIENT", 2, -1, cmdClient},
+	"SET":     {"SET", 3, -1, cmdSet}, // EX, PX (NX, XX, KEEPTTL, GET planned)
+	"GET":     {"GET", 2, 2, cmdGet},
+	"DEL":     {"DEL", 2, -1, cmdDel},
+	"EXISTS":  {"EXISTS", 2, -1, cmdExists},
+	"FLUSHDB": {"FLUSHDB", 1, 1, cmdFlushDB},
+	"HELLO":   {"HELLO", 1, -1, cmdHello},
+	"CLIENT":  {"CLIENT", 2, -1, cmdClient},
+	"PING":    {"PING", 1, 2, cmdPing},
 }
 
 func dispatch(store Store, state *clientState, args []string) Reply {
@@ -105,6 +108,25 @@ func cmdDel(store Store, state *clientState, args []string) Reply {
 	return intReply(n)
 }
 
+func cmdExists(store Store, state *clientState, args []string) Reply {
+	var n int64
+	for _, k := range args[1:] {
+		c, err := store.Exists(k)
+		if err != nil {
+			return errReply("ERR exists failed: " + err.Error())
+		}
+		n += int64(c)
+	}
+	return intReply(n)
+}
+
+func cmdFlushDB(store Store, state *clientState, args []string) Reply {
+	if err := store.FlushDB(); err != nil {
+		return errReply("ERR flushdb failed: " + err.Error())
+	}
+	return simpleString("OK")
+}
+
 func cmdHello(store Store, state *clientState, args []string) Reply {
 	if len(args) == 1 {
 		return helloReply(state)
@@ -113,12 +135,18 @@ func cmdHello(store Store, state *clientState, args []string) Reply {
 	if err != nil || (protocol_version != 2 && protocol_version != 3) {
 		return errReply("NOPROTO unsupported protocol version")
 	}
-	if len(args) > 2 {
-		opt := strings.ToUpper(args[2])
-		if opt == "AUTH" {
-			return errReply("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?")
+	for i := 2; i < len(args); i++ {
+		opt := strings.ToUpper(args[i])
+		if opt != "AUTH" {
+			return errReply(fmt.Sprintf("Syntax error in HELLO option '%s'", args[i]))
 		}
-		return errReply("ERR unsupported HELLO option '" + opt + "'")
+		if i+2 >= len(args) {
+			return errReply(fmt.Sprintf("Syntax error in HELLO option '%s'", args[i]))
+		}
+		if args[i+1] != "default" {
+			return errReply("WRONGPASS invalid username-password pair or user is disabled.")
+		}
+		i += 2
 	}
 	state.protocol_version = protocol_version
 	return helloReply(state)
@@ -134,6 +162,13 @@ func helloReply(state *clientState) Reply {
 		bulkReply([]byte("role")), bulkReply([]byte("master")),
 		bulkReply([]byte("modules")), arrayReply(nil),
 	})
+}
+
+func cmdPing(store Store, state *clientState, args []string) Reply {
+	if len(args) == 2 {
+		return bulkReply([]byte(args[1]))
+	}
+	return simpleString("PONG")
 }
 
 func cmdClient(store Store, state *clientState, args []string) Reply {

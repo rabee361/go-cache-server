@@ -186,6 +186,68 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestExists(t *testing.T) {
+	tests := []struct {
+		name      string
+		key       string
+		setupKeys map[string][]byte
+		expire    string
+		want      uint64
+	}{
+		{"exists_existing", "foo", map[string][]byte{"foo": []byte("bar")}, "", 1},
+		{"exists_missing", "nope", map[string][]byte{}, "", 0},
+		{"exists_empty_key", "", map[string][]byte{"": []byte("v")}, "", 1},
+		{"exists_expired", "old", map[string][]byte{"old": []byte("v")}, "old", 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestStore()
+			setKeys(s, tc.setupKeys)
+			if tc.expire != "" {
+				now := time.Now().UnixMilli()
+				s.mu.Lock()
+				e := s.data[tc.expire]
+				e.expiresAt = now - 100
+				s.data[tc.expire] = e
+				s.mu.Unlock()
+			}
+
+			got, err := s.Exists(tc.key)
+			if err != nil {
+				t.Fatalf("Exists() error = %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("Exists(%q) = %d, want %d", tc.key, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFlushDB(t *testing.T) {
+	t.Run("clears_keys", func(t *testing.T) {
+		s := newTestStore()
+		s.Set("a", []byte("1"), 0)
+		s.Set("b", []byte("2"), 0)
+		if err := s.FlushDB(); err != nil {
+			t.Fatalf("FlushDB() error = %v", err)
+		}
+		if len(s.data) != 0 {
+			t.Errorf("len(data) after FlushDB = %d, want 0", len(s.data))
+		}
+		if n, _ := s.Exists("a"); n != 0 {
+			t.Errorf("Exists(a) after FlushDB = %d, want 0", n)
+		}
+	})
+
+	t.Run("empty_store", func(t *testing.T) {
+		s := newTestStore()
+		if err := s.FlushDB(); err != nil {
+			t.Fatalf("FlushDB() on empty store error = %v", err)
+		}
+	})
+}
+
 func TestExpiry(t *testing.T) {
 	s := newTestStore()
 	now := time.Now().UnixMilli()
@@ -265,10 +327,10 @@ func TestConcurrentAccess(t *testing.T) {
 
 func TestWriteReply(t *testing.T) {
 	tests := []struct {
-		name  string
+		name             string
 		protocol_version int
-		in    Reply
-		want  string
+		in               Reply
+		want             string
 	}{
 		{"simple_string", 2, simpleString("OK"), "+OK\r\n"},
 		{"error", 2, errReply("ERR x"), "-ERR x\r\n"},
@@ -421,7 +483,14 @@ func TestDispatch(t *testing.T) {
 		{"get_too_many", []string{"GET", "a", "b"}, errReply("ERR wrong number of arguments for 'GET' command")},
 		{"del_too_few", []string{"DEL"}, errReply("ERR wrong number of arguments for 'DEL' command")},
 		{"client_too_few", []string{"CLIENT"}, errReply("ERR wrong number of arguments for 'CLIENT' command")},
-		{"unknown", []string{"PING"}, errReply("ERR unknown command 'PING'")},
+		{"unknown", []string{"BOGUSCMD"}, errReply("ERR unknown command 'BOGUSCMD'")},
+		{"ping", []string{"PING"}, simpleString("PONG")},
+		{"ping_message", []string{"PING", "hello"}, bulkReply([]byte("hello"))},
+		{"ping_too_many", []string{"PING", "a", "b"}, errReply("ERR wrong number of arguments for 'PING' command")},
+		{"exists_arity", []string{"EXISTS"}, errReply("ERR wrong number of arguments for 'EXISTS' command")},
+		{"exists_missing", []string{"EXISTS", "k"}, intReply(0)},
+		{"flushdb_ok", []string{"FLUSHDB"}, simpleString("OK")},
+		{"flushdb_arity", []string{"FLUSHDB", "x"}, errReply("ERR wrong number of arguments for 'FLUSHDB' command")},
 		{"get_missing", []string{"get", "k"}, nullReply()},
 		{"set_lowercase", []string{"SeT", "k", "v"}, simpleString("OK")},
 		{"set_ex", []string{"SET", "k", "v", "EX", "100"}, simpleString("OK")},
@@ -435,8 +504,10 @@ func TestDispatch(t *testing.T) {
 		{"client_unknown_sub", []string{"CLIENT", "FOO"}, errReply("ERR Unknown subcommand or wrong number of arguments for 'FOO'. Try CLIENT HELP.")},
 		{"hello_bad_proto", []string{"HELLO", "4"}, errReply("NOPROTO unsupported protocol version")},
 		{"hello_proto_junk", []string{"HELLO", "abc"}, errReply("NOPROTO unsupported protocol version")},
-		{"hello_auth", []string{"HELLO", "3", "AUTH", "default", "secret"}, errReply("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?")},
-		{"hello_setname", []string{"HELLO", "3", "SETNAME", "me"}, errReply("ERR unsupported HELLO option 'SETNAME'")},
+		{"hello_auth_incomplete", []string{"HELLO", "3", "AUTH"}, errReply("Syntax error in HELLO option 'AUTH'")},
+		{"hello_auth_missing_password", []string{"HELLO", "3", "AUTH", "default"}, errReply("Syntax error in HELLO option 'AUTH'")},
+		{"hello_auth_unknown_user", []string{"HELLO", "3", "AUTH", "nosuch", "secret"}, errReply("WRONGPASS invalid username-password pair or user is disabled.")},
+		{"hello_setname", []string{"HELLO", "3", "SETNAME", "me"}, errReply("Syntax error in HELLO option 'SETNAME'")},
 	}
 
 	for _, tc := range tests {
@@ -477,12 +548,20 @@ func TestHelloDispatch(t *testing.T) {
 		t.Errorf("protocol_version after HELLO 2 = %d, want 2", state.protocol_version)
 	}
 
-	// rejected HELLO must not change the protocol
-	if got := dispatch(s, state, []string{"HELLO", "3", "AUTH", "default", "secret"}); got.Kind != '-' {
-		t.Errorf("HELLO AUTH reply = %+v, want an error", got)
+	// complete AUTH against the default (nopass) user succeeds and switches
+	if got := dispatch(s, state, []string{"HELLO", "3", "AUTH", "default", "secret"}); !reflect.DeepEqual(got, helloReply(state)) {
+		t.Errorf("HELLO 3 AUTH reply = %+v, want %+v", got, helloReply(state))
 	}
-	if state.protocol_version != 2 {
-		t.Errorf("protocol_version after rejected HELLO = %d, want 2 (unchanged)", state.protocol_version)
+	if state.protocol_version != 3 {
+		t.Errorf("protocol_version after HELLO 3 AUTH = %d, want 3", state.protocol_version)
+	}
+
+	// unknown username fails without changing the protocol
+	if got := dispatch(s, state, []string{"HELLO", "2", "AUTH", "nosuch", "secret"}); got.Kind != '-' {
+		t.Errorf("HELLO AUTH nosuch reply = %+v, want an error", got)
+	}
+	if state.protocol_version != 3 {
+		t.Errorf("protocol_version after rejected HELLO = %d, want 3 (unchanged)", state.protocol_version)
 	}
 }
 
@@ -518,6 +597,30 @@ func TestCommandHandlers(t *testing.T) {
 		}
 		if got := dispatch(s, newClientState(), []string{"DEL", "a"}); !reflect.DeepEqual(got, intReply(0)) {
 			t.Errorf("second DEL reply = %+v, want :0", got)
+		}
+	})
+
+	t.Run("exists_counts", func(t *testing.T) {
+		s := newTestStore()
+		s.Set("a", []byte("1"), 0)
+		s.Set("b", []byte("2"), 0)
+		if got := dispatch(s, newClientState(), []string{"EXISTS", "a", "b", "c"}); !reflect.DeepEqual(got, intReply(2)) {
+			t.Errorf("EXISTS reply = %+v, want :2", got)
+		}
+		if got := dispatch(s, newClientState(), []string{"EXISTS", "a"}); !reflect.DeepEqual(got, intReply(1)) {
+			t.Errorf("second EXISTS reply = %+v, want :1", got)
+		}
+	})
+
+	t.Run("flushdb_clears_store", func(t *testing.T) {
+		s := newTestStore()
+		s.Set("a", []byte("1"), 0)
+		s.Set("b", []byte("2"), 0)
+		if got := dispatch(s, newClientState(), []string{"FLUSHDB"}); !reflect.DeepEqual(got, simpleString("OK")) {
+			t.Fatalf("FLUSHDB reply = %+v, want +OK", got)
+		}
+		if got := dispatch(s, newClientState(), []string{"EXISTS", "a", "b"}); !reflect.DeepEqual(got, intReply(0)) {
+			t.Errorf("EXISTS after FLUSHDB = %+v, want :0", got)
 		}
 	})
 

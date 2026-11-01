@@ -327,6 +327,56 @@ func TestE2EHello(t *testing.T) {
 	}
 }
 
+func TestE2EPing(t *testing.T) {
+	addr := startTestServer(t, newTestStore())
+	conn, r := dialServer(t, addr)
+
+	sendBytes(t, conn, []byte("*1\r\n$4\r\nPING\r\n"))
+	if got := readResp(t, r); got != "+PONG\r\n" {
+		t.Fatalf("PING reply = %q, want %q", got, "+PONG\r\n")
+	}
+
+	// PING with a message echoes the message back as a bulk string
+	sendBytes(t, conn, []byte("*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"))
+	if got := readResp(t, r); got != "$5\r\nhello\r\n" {
+		t.Errorf("PING message reply = %q, want %q", got, "$5\r\nhello\r\n")
+	}
+
+	// inline form too
+	sendBytes(t, conn, []byte("PING\r\n"))
+	if got := readResp(t, r); got != "+PONG\r\n" {
+		t.Errorf("inline PING reply = %q, want %q", got, "+PONG\r\n")
+	}
+}
+
+func TestE2EHelloAuth(t *testing.T) {
+	addr := startTestServer(t, newTestStore())
+	conn, r := dialServer(t, addr)
+
+	// incomplete AUTH → Redis's exact syntax error
+	sendBytes(t, conn, []byte("*3\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n"))
+	if got := readResp(t, r); got != "-Syntax error in HELLO option 'AUTH'\r\n" {
+		t.Errorf("HELLO 3 AUTH = %q, want %q", got, "-Syntax error in HELLO option 'AUTH'\r\n")
+	}
+
+	// unknown user → WRONGPASS
+	sendBytes(t, conn, []byte("*5\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$6\r\nnosuch\r\n$6\r\nsecret\r\n"))
+	if got := readResp(t, r); got != "-WRONGPASS invalid username-password pair or user is disabled.\r\n" {
+		t.Errorf("HELLO 3 AUTH nosuch secret = %q, want %q", got, "-WRONGPASS invalid username-password pair or user is disabled.\r\n")
+	}
+
+	// default user is nopass: AUTH default <anything> succeeds and switches to RESP3
+	sendBytes(t, conn, []byte("*5\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$6\r\nsecret\r\n"))
+	got := readResp(t, r)
+	if !strings.HasPrefix(got, "%7\r\n") || !strings.Contains(got, "$5\r\nproto\r\n:3\r\n") {
+		t.Errorf("HELLO 3 AUTH default secret = %q, want a RESP3 map with proto 3", got)
+	}
+	sendBytes(t, conn, []byte("*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n"))
+	if got := readResp(t, r); got != "_\r\n" {
+		t.Errorf("GET missing after HELLO AUTH = %q, want %q", got, "_\r\n")
+	}
+}
+
 func TestE2EConcurrent(t *testing.T) {
 	addr := startTestServer(t, newTestStore())
 	const numClients = 50
