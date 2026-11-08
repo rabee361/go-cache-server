@@ -116,6 +116,10 @@ func handleConn(conn net.Conn, store *MemoryStore) {
 	}()
 
 	state := newClientState()
+	remote := conn.RemoteAddr().String()
+	logComm("[conn %d] connected from %s", state.id, remote)
+	defer logComm("[conn %d] disconnected (%s)", state.id, remote)
+
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
@@ -125,11 +129,14 @@ func handleConn(conn net.Conn, store *MemoryStore) {
 			if errors.Is(err, io.EOF) {
 				return
 			}
+			logComm("[conn %d] read error: %v", state.id, err)
 			writer.Flush()
 			return
 		}
 
+		logComm("[conn %d] --> %s", state.id, argsSummary(args))
 		reply := dispatch(store, state, args)
+		logComm("[conn %d] <-- %s", state.id, replySummary(reply))
 		writeReply(writer, state.protocol_version, reply)
 		writer.Flush()
 	}
@@ -137,7 +144,12 @@ func handleConn(conn net.Conn, store *MemoryStore) {
 
 func main() {
 	addr := flag.String("addr", "localhost:6379", "listen address")
+	enableLog := flag.Bool("log", true, "log client/server communication to stdout")
 	flag.Parse()
+
+	if *enableLog {
+		enableTrafficLogging()
+	}
 
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {

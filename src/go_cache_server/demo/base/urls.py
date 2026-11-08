@@ -5,7 +5,7 @@ from .views import *
 
 urlpatterns = [
     path('api/posts/', PostView.as_view()),
-    path('api/signup/', SignupSimView.as_view(), name='signup'),
+    path('api/signup/', SignupView.as_view(), name='signup'),
     path('posts/simple/', PostsSimpleView.as_view(), name='posts_simple'),
     path('posts/paginated/', PostsPaginatedView.as_view(), name='posts_paginated'),
 ]

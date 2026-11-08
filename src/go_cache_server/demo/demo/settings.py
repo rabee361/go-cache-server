@@ -12,22 +12,23 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 
 import os
 from pathlib import Path
+import environ
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+env = environ.Env()
+environ.Env.read_env(os.path.join(BASE_DIR , 'demo', '.env'))
 
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-3^70ha7-!xu-0%2-#6onh+%l1(mjd!uo5r7if72tvrl8h(z!+%'
+SECRET_KEY = env('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = ["*"]
-
+DEBUG = env.bool('DEBUG')
+ALLOWED_HOSTS = env.list('ALLOWED_HOSTS')
 
 # Application definition
 
@@ -145,6 +146,11 @@ MAILERS = {
 }
 
 
-CELERY_BROKER_URL = 'redis://localhost:6379'
+CELERY_BROKER_URL = env('CELERY_BROKER_URL')
 
-CELERY_RESULT_BACKEND = 'redis://localhost:6379'
+CELERY_RESULT_BACKEND = env('CELERY_RESULT_BACKEND')
+
+CELERY_RESULT_EXPIRES = env.int('CELERY_RESULT_EXPIRES', default=3600)
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    'visibility_timeout': env.int('CELERY_VISIBILITY_TIMEOUT', default=3600),
+}
