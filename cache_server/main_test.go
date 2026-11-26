@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	// "math"
 	"reflect"
 	"strings"
 	"sync"
@@ -651,4 +652,432 @@ func TestCommandHandlers(t *testing.T) {
 			}
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Celery-facing store tests (lists, sets, sorted sets)
+// ---------------------------------------------------------------------------
+
+func TestLPushRPop(t *testing.T) {
+	s := newTestStore()
+
+	n, err := s.LPush("q", "a")
+	if err != nil || n != 1 {
+		t.Fatalf("LPush(q, a) = %d, %v; want 1, nil", n, err)
+	}
+	// LPUSH q b c prepends each in order → list is [c b a]
+	n, err = s.LPush("q", "b", "c")
+	if err != nil || n != 3 {
+		t.Fatalf("LPush(q, b, c) = %d, %v; want 3, nil", n, err)
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		v, ok := s.RPop("q")
+		if !ok || v != want {
+			t.Errorf("RPop(q) = %q, %v; want %q, true", v, ok, want)
+		}
+	}
+	if v, ok := s.RPop("q"); ok {
+		t.Errorf("RPop on drained list = %q, %v; want \"\", false", v, ok)
+	}
+	if _, ok := s.lists["q"]; ok {
+		t.Errorf("empty list key was left behind in the map")
+	}
+}
+
+func TestLRemDirections(t *testing.T) {
+	build := func() *MemoryStore {
+		s := newTestStore()
+		s.LPush("l", "x") // [x]
+		s.lists["l"] = []string{"x", "y", "x", "z", "x"}
+		return s
+	}
+
+	t.Run("count_positive_removes_from_head", func(t *testing.T) {
+		s := build()
+		got, err := s.LRem("l", 2, "x")
+		if err != nil || got != 2 {
+			t.Fatalf("LRem = %d, %v; want 2, nil", got, err)
+		}
+		if want := []string{"y", "z", "x"}; !reflect.DeepEqual(s.lists["l"], want) {
+			t.Errorf("list = %v, want %v", s.lists["l"], want)
+		}
+	})
+
+	t.Run("count_negative_removes_from_tail", func(t *testing.T) {
+		s := build()
+		got, err := s.LRem("l", -2, "x")
+		if err != nil || got != 2 {
+			t.Fatalf("LRem = %d, %v; want 2, nil", got, err)
+		}
+		if want := []string{"x", "y", "z"}; !reflect.DeepEqual(s.lists["l"], want) {
+			t.Errorf("list = %v, want %v", s.lists["l"], want)
+		}
+	})
+
+	t.Run("count_zero_removes_all", func(t *testing.T) {
+		s := build()
+		got, err := s.LRem("l", 0, "x")
+		if err != nil || got != 3 {
+			t.Fatalf("LRem = %d, %v; want 3, nil", got, err)
+		}
+		if want := []string{"y", "z"}; !reflect.DeepEqual(s.lists["l"], want) {
+			t.Errorf("list = %v, want %v", s.lists["l"], want)
+		}
+	})
+
+	t.Run("missing_key_and_no_match", func(t *testing.T) {
+		s := newTestStore()
+		if got, _ := s.LRem("nope", 0, "x"); got != 0 {
+			t.Errorf("LRem on missing key = %d, want 0", got)
+		}
+		s.LPush("l", "a")
+		if got, _ := s.LRem("l", 0, "x"); got != 0 {
+			t.Errorf("LRem with no match = %d, want 0", got)
+		}
+	})
+}
+
+// func TestSAddDedup(t *testing.T) {
+// 	s := newTestStore()
+// 	if got, err := s.SAdd("revoked", "t1", "t2"); err != nil || got != 2 {
+// 		t.Fatalf("SAdd = %d, %v; want 2, nil", got, err)
+// 	}
+// 	if got, err := s.SAdd("revoked", "t2", "t3"); err != nil || got != 1 {
+// 		t.Fatalf("SAdd dup = %d, %v; want 1 (only t3 is new), nil", got, err)
+// 	}
+// 	if len(s.sets["revoked"]) != 3 {
+// 		t.Errorf("set size = %d, want 3", len(s.sets["revoked"]))
+// 	}
+// }
+
+// func TestZAddZRangeByScore(t *testing.T) {
+// 	s := newTestStore()
+// 	if got, err := s.ZAdd("unacked", "task-b", 200); err != nil || got != 1 {
+// 		t.Fatalf("ZAdd b = %d, %v; want 1, nil", got, err)
+// 	}
+// 	if got, _ := s.ZAdd("unacked", "task-a", 100); got != 1 {
+// 		t.Fatalf("ZAdd a = %d, want 1", got)
+// 	}
+// 	// Updating an existing member scores 0 added.
+// 	if got, _ := s.ZAdd("unacked", "task-a", 150); got != 0 {
+// 		t.Errorf("ZAdd update = %d, want 0", got)
+// 	}
+
+// 	got, err := s.ZRangeByScore("unacked", math.Inf(-1), math.Inf(1), false, false)
+// 	if err != nil {
+// 		t.Fatalf("ZRangeByScore: %v", err)
+// 	}
+// 	if want := []string{"task-a", "task-b"}; !reflect.DeepEqual(got, want) {
+// 		t.Errorf("full range = %v, want %v (score order)", got, want)
+// 	}
+// 	// Exclusive lower bound skips task-a at exactly 150.
+// 	got, _ = s.ZRangeByScore("unacked", 150, math.Inf(1), true, false)
+// 	if want := []string{"task-b"}; !reflect.DeepEqual(got, want) {
+// 		t.Errorf("exclusive min = %v, want %v", got, want)
+// 	}
+// 	// Nothing in range → empty (not nil) slice.
+// 	got, _ = s.ZRangeByScore("unacked", 1000, 2000, false, false)
+// 	if len(got) != 0 {
+// 		t.Errorf("out-of-range = %v, want empty", got)
+// 	}
+// }
+
+func TestWrongTypeGuards(t *testing.T) {
+	s := newTestStore()
+	if err := s.Set("str", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LPush("str", "x"); !errors.Is(err, ErrWrongType) {
+		t.Errorf("LPush on string key: err = %v, want ErrWrongType", err)
+	}
+	// if _, err := s.SAdd("str", "x"); !errors.Is(err, ErrWrongType) {
+	// 	t.Errorf("SAdd on string key: err = %v, want ErrWrongType", err)
+	// }
+	// if _, err := s.ZAdd("str", "x", 1); !errors.Is(err, ErrWrongType) {
+	// 	t.Errorf("ZAdd on string key: err = %v, want ErrWrongType", err)
+	// }
+
+	// The other direction: SET overwrites a list (Redis behavior).
+	s.LPush("l", "item")
+	if err := s.Set("l", []byte("now a string"), 0); err != nil {
+		t.Fatalf("Set over list key: %v", err)
+	}
+	if _, ok := s.RPop("l"); ok {
+		t.Errorf("list survived SET overwrite")
+	}
+	if v, ok := s.Get("l"); !ok || string(v) != "now a string" {
+		t.Errorf("Get after overwrite = %q, %v", v, ok)
+	}
+}
+
+func TestDeleteExistsAcrossTypes(t *testing.T) {
+	s := newTestStore()
+	s.LPush("list", "x")
+	// s.SAdd("set", "m")
+	// s.ZAdd("zset", "m", 1)
+	s.Set("str", []byte("v"), 0)
+
+	for _, k := range []string{"list", "set", "zset", "str"} {
+		if n, _ := s.Exists(k); n != 1 {
+			t.Errorf("Exists(%s) = %d, want 1", k, n)
+		}
+		if n, _ := s.Delete(k); n != 1 {
+			t.Errorf("Delete(%s) = %d, want 1", k, n)
+		}
+		if n, _ := s.Exists(k); n != 0 {
+			t.Errorf("Exists(%s) after delete = %d, want 0", k, n)
+		}
+	}
+}
+
+func TestMaxMemoryOOM(t *testing.T) {
+	defer func(old int64) { serverConfig.SetMaxMemory(old) }(serverConfig.MaxMemory())
+	// Budget for exactly one entry: len(k)+len(v)+overhead = 1+100+64 = 165.
+	serverConfig.SetMaxMemory(200)
+	s := newTestStore()
+
+	val := make([]byte, 100)
+	if err := s.Set("k", val, 0); err != nil {
+		t.Fatalf("first Set within budget: %v", err)
+	}
+	err := s.Set("k2", val, 0)
+	if !errors.Is(err, ErrOOM) {
+		t.Fatalf("second Set over budget: err = %v, want ErrOOM", err)
+	}
+	// Overwrite within budget is fine (old size released first).
+	if err := s.Set("k", make([]byte, 50), 0); err != nil {
+		t.Errorf("shrinking overwrite: %v", err)
+	}
+	// Delete frees budget for new writes.
+	s.Delete("k")
+	if err := s.Set("k2", val, 0); err != nil {
+		t.Errorf("Set after Delete freed budget: %v", err)
+	}
+	// Unlimited again.
+	serverConfig.SetMaxMemory(0)
+	if err := s.Set("k3", make([]byte, 10000), 0); err != nil {
+		t.Errorf("Set with maxmemory=0: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Command tests: Celery commands + CONFIG
+// ---------------------------------------------------------------------------
+
+func TestDispatchCeleryCommands(t *testing.T) {
+	s := newTestStore()
+	st := newClientState()
+
+	if got := dispatch(s, st, []string{"LPUSH", "celery", "task1"}); !reflect.DeepEqual(got, intReply(1)) {
+		t.Errorf("LPUSH = %+v, want :1", got)
+	}
+	want := arrayReply([]Reply{bulkReply([]byte("celery")), bulkReply([]byte("task1"))})
+	if got := dispatch(s, st, []string{"BRPOP", "celery", "1"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("BRPOP = %+v, want [celery task1]", got)
+	}
+	if got := dispatch(s, st, []string{"BRPOP", "celery", "0.01"}); !reflect.DeepEqual(got, nullArrayReply()) {
+		t.Errorf("BRPOP on empty = %+v, want null array", got)
+	}
+	if got := dispatch(s, st, []string{"SADD", "celery.revoked", "tid"}); !reflect.DeepEqual(got, intReply(1)) {
+		t.Errorf("SADD = %+v, want :1", got)
+	}
+	if got := dispatch(s, st, []string{"ZADD", "celery.unacked", "100", "tid"}); !reflect.DeepEqual(got, intReply(1)) {
+		t.Errorf("ZADD = %+v, want :1", got)
+	}
+	if got := dispatch(s, st, []string{"ZRANGEBYSCORE", "celery.unacked", "-inf", "+inf"}); !reflect.DeepEqual(got, arrayReply([]Reply{bulkReply([]byte("tid"))})) {
+		t.Errorf("ZRANGEBYSCORE = %+v, want [tid]", got)
+	}
+
+	// Error paths.
+	for _, tc := range []struct {
+		name string
+		args []string
+		want Reply
+	}{
+		{"lpush_arity", []string{"LPUSH", "q"}, errReply("ERR wrong number of arguments for 'LPUSH' command")},
+		{"brpop_arity", []string{"BRPOP", "1"}, errReply("ERR wrong number of arguments for 'BRPOP' command")},
+		{"brpop_bad_timeout", []string{"BRPOP", "q", "abc"}, errReply("ERR timeout is not a float or out of range")},
+		{"brpop_negative_timeout", []string{"BRPOP", "q", "-1"}, errReply("ERR timeout is not a float or out of range")},
+		{"lrem_bad_count", []string{"LREM", "q", "x", "1"}, errReply("ERR value is not an integer or out of range")},
+		{"zadd_odd_pairs", []string{"ZADD", "z", "1", "m", "2"}, errReply("ERR syntax error")},
+		{"zadd_bad_float", []string{"ZADD", "z", "score", "m"}, errReply("ERR value is not a valid float")},
+		{"zrange_bad_min", []string{"ZRANGEBYSCORE", "z", "junk", "+inf"}, errReply("ERR min or max is not a float")},
+		{"zrange_bad_max", []string{"ZRANGEBYSCORE", "z", "-inf", "junk"}, errReply("ERR min or max is not a float")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dispatch(newTestStore(), newClientState(), tc.args); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("lrem_via_dispatch", func(t *testing.T) {
+		s := newTestStore()
+		dispatch(s, st, []string{"LPUSH", "l", "a"})
+		dispatch(s, st, []string{"LPUSH", "l", "b"})
+		if got := dispatch(s, st, []string{"LREM", "l", "0", "a"}); !reflect.DeepEqual(got, intReply(1)) {
+			t.Errorf("LREM = %+v, want :1", got)
+		}
+	})
+
+	t.Run("wrongtype_via_dispatch", func(t *testing.T) {
+		s := newTestStore()
+		dispatch(s, st, []string{"SET", "str", "v"})
+		if got := dispatch(s, st, []string{"LPUSH", "str", "x"}); !reflect.DeepEqual(got, errReply(ErrWrongType.Error())) {
+			t.Errorf("LPUSH on string = %+v, want WRONGTYPE error", got)
+		}
+	})
+
+	t.Run("oom_via_dispatch", func(t *testing.T) {
+		defer func(old int64) { serverConfig.SetMaxMemory(old) }(serverConfig.MaxMemory())
+		serverConfig.SetMaxMemory(100)
+		got := dispatch(newTestStore(), st, []string{"SET", "k", strings.Repeat("x", 200)})
+		if !reflect.DeepEqual(got, errReply(ErrOOM.Error())) {
+			t.Errorf("SET over budget = %+v, want %q", got, ErrOOM.Error())
+		}
+	})
+}
+
+func TestParseMemSize(t *testing.T) {
+	tests := []struct {
+		in   string
+		want int64
+		ok   bool
+	}{
+		{"0", 0, true},
+		{"1024", 1024, true},
+		{"10b", 10, true},
+		{"1k", 1024, true},
+		{"1kb", 1024, true},
+		{"2m", 2 * 1024 * 1024, true},
+		{"2mb", 2 * 1024 * 1024, true},
+		{"1g", 1024 * 1024 * 1024, true},
+		{"1gb", 1024 * 1024 * 1024, true},
+		{"1GB", 1024 * 1024 * 1024, true},
+		{"100 mb", 100 * 1024 * 1024, true},
+		{"-5", 0, false},
+		{"abc", 0, false},
+		{"mb", 0, false},
+		{"", 0, false},
+		{"99999999999999gb", 0, false},
+	}
+	for _, tc := range tests {
+		got, err := parseMemSize(tc.in)
+		if tc.ok && (err != nil || got != tc.want) {
+			t.Errorf("parseMemSize(%q) = %d, %v; want %d, nil", tc.in, got, err, tc.want)
+		}
+		if !tc.ok && err == nil {
+			t.Errorf("parseMemSize(%q) = %d, nil; want error", tc.in, got)
+		}
+	}
+}
+
+// func TestParseScoreBound(t *testing.T) {
+// 	tests := []struct {
+// 		in       string
+// 		want     float64
+// 		wantExcl bool
+// 		ok       bool
+// 	}{
+// 		{"-inf", math.Inf(-1), false, true},
+// 		{"+inf", math.Inf(1), false, true},
+// 		{"inf", math.Inf(1), false, true},
+// 		{"100", 100, false, true},
+// 		{"-3.5", -3.5, false, true},
+// 		{"(100", 100, true, true},
+// 		{"(-inf", math.Inf(-1), true, true},
+// 		{"junk", 0, false, false},
+// 		{"(", 0, false, false},
+// 	}
+// 	for _, tc := range tests {
+// 		got, excl, err := parseScoreBound(tc.in)
+// 		if tc.ok && (err != nil || got != tc.want || excl != tc.wantExcl) {
+// 			t.Errorf("parseScoreBound(%q) = %v, %v, %v; want %v, %v, nil", tc.in, got, excl, err, tc.want, tc.wantExcl)
+// 		}
+// 		if !tc.ok && err == nil {
+// 			t.Errorf("parseScoreBound(%q) = %v, want error", tc.in, got)
+// 		}
+// 	}
+// }
+
+func TestConfigCommands(t *testing.T) {
+	defer func(mm int64, mc int) {
+		serverConfig.SetMaxMemory(mm)
+		serverConfig.SetMaxClients(mc)
+	}(serverConfig.MaxMemory(), serverConfig.MaxClients())
+
+	s := newTestStore()
+	st := newClientState()
+
+	// CONFIG SET maxmemory with unit suffix.
+	if got := dispatch(s, st, []string{"CONFIG", "SET", "maxmemory", "100mb"}); !reflect.DeepEqual(got, simpleString("OK")) {
+		t.Fatalf("CONFIG SET maxmemory = %+v, want +OK", got)
+	}
+	if mm := serverConfig.MaxMemory(); mm != 100*1024*1024 {
+		t.Errorf("MaxMemory = %d, want %d", mm, 100*1024*1024)
+	}
+
+	// CONFIG GET exact name → flat [name, value] array.
+	want := arrayReply([]Reply{bulkReply([]byte("maxmemory")), bulkReply([]byte("104857600"))})
+	if got := dispatch(s, st, []string{"CONFIG", "GET", "maxmemory"}); !reflect.DeepEqual(got, want) {
+		t.Errorf("CONFIG GET maxmemory = %+v, want %+v", got, want)
+	}
+
+	// CONFIG GET glob returns both params (maxmemory, maxclients).
+	got := dispatch(s, st, []string{"CONFIG", "GET", "max*"})
+	if len(got.Arr) != 4 {
+		t.Errorf("CONFIG GET max* returned %d elements, want 4 (two name/value pairs)", len(got.Arr))
+	}
+
+	// CONFIG GET miss → empty array.
+	if got := dispatch(s, st, []string{"CONFIG", "GET", "nosuchparam"}); !reflect.DeepEqual(got, arrayReply(nil)) {
+		t.Errorf("CONFIG GET miss = %+v, want empty array", got)
+	}
+
+	// RESP3 connections get a map, like real Redis (redis-py 8 defaults to
+	// RESP3 and its CONFIG GET callback requires the map shape).
+	st3 := newClientState()
+	dispatch(s, st3, []string{"HELLO", "3"})
+	wantMap := mapReply([]Reply{bulkReply([]byte("maxmemory")), bulkReply([]byte("104857600"))})
+	if got := dispatch(s, st3, []string{"CONFIG", "GET", "maxmemory"}); !reflect.DeepEqual(got, wantMap) {
+		t.Errorf("CONFIG GET in RESP3 = %+v, want map %+v", got, wantMap)
+	}
+
+	// CONFIG SET maxclients takes effect at runtime.
+	if got := dispatch(s, st, []string{"CONFIG", "SET", "maxclients", "5"}); !reflect.DeepEqual(got, simpleString("OK")) {
+		t.Fatalf("CONFIG SET maxclients = %+v, want +OK", got)
+	}
+	if mc := serverConfig.MaxClients(); mc != 5 {
+		t.Errorf("MaxClients = %d, want 5", mc)
+	}
+
+	// All-or-nothing: bad second pair leaves the first unapplied.
+	got = dispatch(s, st, []string{"CONFIG", "SET", "maxclients", "7", "maxmemory", "garbage"})
+	if !reflect.DeepEqual(got, errReply("ERR argument couldn't be parsed into an integer")) {
+		t.Errorf("mixed SET = %+v, want parse error", got)
+	}
+	if mc := serverConfig.MaxClients(); mc != 5 {
+		t.Errorf("MaxClients after failed SET = %d, want 5 (unchanged)", mc)
+	}
+
+	// Error paths.
+	for _, tc := range []struct {
+		name string
+		args []string
+		want Reply
+	}{
+		{"bare_config", []string{"CONFIG"}, errReply("ERR wrong number of arguments for 'CONFIG' command")},
+		{"get_arity", []string{"CONFIG", "GET"}, errReply("ERR wrong number of arguments for 'config|get' command")},
+		{"set_arity", []string{"CONFIG", "SET", "maxmemory"}, errReply("ERR wrong number of arguments for 'config|set' command")},
+		{"set_odd_args", []string{"CONFIG", "SET", "maxmemory", "1", "maxclients"}, errReply("ERR wrong number of arguments for 'config|set' command")},
+		{"unknown_param", []string{"CONFIG", "SET", "maxmemory-policy", "allkeys-lru"}, errReply("ERR Unsupported CONFIG parameter: maxmemory-policy")},
+		{"maxclients_zero", []string{"CONFIG", "SET", "maxclients", "0"}, errReply("ERR argument couldn't be parsed into an integer")},
+		{"unknown_sub", []string{"CONFIG", "REWRITE"}, errReply("ERR Unknown subcommand or wrong number of arguments for 'REWRITE'. Try CONFIG HELP.")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dispatch(newTestStore(), newClientState(), tc.args); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
 }

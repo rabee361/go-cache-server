@@ -31,6 +31,7 @@ func nullReply() Reply            { return Reply{Kind: '$', Null: true} }
 func arrayReply(elems []Reply) Reply {
 	return Reply{Kind: '*', Arr: elems}
 }
+func nullArrayReply() Reply { return Reply{Kind: '*', Null: true} }
 func mapReply(entries []Reply) Reply {
 	return Reply{Kind: '%', Map: entries}
 }
@@ -65,6 +66,14 @@ func writeReply(writer *bufio.Writer, proto int, reader Reply) error {
 			return err
 		}
 	case '*':
+		if reader.Null {
+			if proto >= 3 {
+				_, err := writer.WriteString("_\r\n")
+				return err
+			}
+			_, err := writer.WriteString("*-1\r\n")
+			return err
+		}
 		if _, err := fmt.Fprintf(writer, "*%d\r\n", len(reader.Arr)); err != nil {
 			return err
 		}
@@ -100,7 +109,6 @@ func readCommand(reader *bufio.Reader) ([]string, error) {
 		return nil, err
 	}
 	if first[0] != '*' {
-		fmt.Println("Inline command received", first[0])
 		return readInline(reader)
 	}
 	return readArray(reader)

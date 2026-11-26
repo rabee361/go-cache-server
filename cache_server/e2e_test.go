@@ -421,3 +421,115 @@ func TestE2EConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// ---------------------------------------------------------------------------
+// Celery-facing commands over the wire
+// ---------------------------------------------------------------------------
+
+func TestE2EListRoundTrip(t *testing.T) {
+	addr := startTestServer(t, newTestStore())
+	conn, r := dialServer(t, addr)
+
+	// LPUSH celery task
+	sendBytes(t, conn, []byte("*3\r\n$5\r\nLPUSH\r\n$6\r\ncelery\r\n$4\r\ntask\r\n"))
+	if got := readResp(t, r); got != ":1\r\n" {
+		t.Fatalf("LPUSH reply = %q, want \":1\\r\\n\"", got)
+	}
+
+	// BRPOP celery 1 → two-element array [key, value]
+	sendBytes(t, conn, []byte("*3\r\n$5\r\nBRPOP\r\n$6\r\ncelery\r\n$1\r\n1\r\n"))
+	want := "*2\r\n$6\r\ncelery\r\n$4\r\ntask\r\n"
+	if got := readResp(t, r); got != want {
+		t.Errorf("BRPOP reply = %q, want %q", got, want)
+	}
+}
+
+func TestE2EBrpopTimeoutNullArray(t *testing.T) {
+	addr := startTestServer(t, newTestStore())
+	conn, r := dialServer(t, addr)
+
+	// RESP2: timeout returns null multibulk *-1
+	sendBytes(t, conn, []byte("*3\r\n$5\r\nBRPOP\r\n$6\r\nemptyq\r\n$4\r\n0.05\r\n"))
+	if got := readResp(t, r); got != "*-1\r\n" {
+		t.Errorf("BRPOP timeout reply = %q, want \"*-1\\r\\n\"", got)
+	}
+}
+
+func TestE2EBrpopWaitsForPush(t *testing.T) {
+	addr := startTestServer(t, newTestStore())
+
+	// A second connection pushes after the BRPOP is already blocking.
+	pusher, _ := dialServer(t, addr)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprintf(pusher, "*3\r\n$5\r\nLPUSH\r\n$1\r\nq\r\n$1\r\nv\r\n")
+	}()
+
+	conn, r := dialServer(t, addr)
+	start := time.Now()
+	sendBytes(t, conn, []byte("*3\r\n$5\r\nBRPOP\r\n$1\r\nq\r\n$1\r\n2\r\n"))
+	want := "*2\r\n$1\r\nq\r\n$1\r\nv\r\n"
+	if got := readResp(t, r); got != want {
+		t.Fatalf("BRPOP reply = %q, want %q", got, want)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Errorf("BRPOP returned in %v — expected it to block until the delayed push", elapsed)
+	}
+}
+
+func TestE2EConfigSetGet(t *testing.T) {
+	defer func(mm int64) { serverConfig.SetMaxMemory(mm) }(serverConfig.MaxMemory())
+	addr := startTestServer(t, newTestStore())
+	conn, r := dialServer(t, addr)
+
+	// CONFIG SET maxmemory 100kb → +OK
+	sendBytes(t, conn, []byte("*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$9\r\nmaxmemory\r\n$5\r\n100kb\r\n"))
+	if got := readResp(t, r); got != "+OK\r\n" {
+		t.Fatalf("CONFIG SET reply = %q, want \"+OK\\r\\n\"", got)
+	}
+
+	// CONFIG GET maxmemory → flat [name, value] pair
+	sendBytes(t, conn, []byte("*3\r\n$6\r\nCONFIG\r\n$3\r\nGET\r\n$9\r\nmaxmemory\r\n"))
+	want := "*2\r\n$9\r\nmaxmemory\r\n$6\r\n102400\r\n"
+	if got := readResp(t, r); got != want {
+		t.Errorf("CONFIG GET reply = %q, want %q", got, want)
+	}
+
+	// The new budget is enforced immediately: a 200kb value gets -OOM.
+	// (Kept under maxBulkLen=1mb so the parser accepts the frame and the
+	// OOM check is what rejects it.)
+	value := strings.Repeat("x", 200*1024)
+	fmt.Fprintf(conn, "*5\r\n$3\r\nSET\r\n$3\r\nbig\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$2\r\n60\r\n", len(value), value)
+	if got := readResp(t, r); got != "-"+ErrOOM.Error()+"\r\n" {
+		t.Errorf("SET over budget = %q, want -OOM error", got)
+	}
+}
+
+func TestE2EMaxClientsReject(t *testing.T) {
+	defer func(mc int) { serverConfig.SetMaxClients(mc) }(serverConfig.MaxClients())
+
+	// activeConns is process-global: wait for earlier tests' handlers to
+	// finish their deferred decrement before we drop the limit to 1.
+	deadline := time.Now().Add(2 * time.Second)
+	for activeConns.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	serverConfig.SetMaxClients(1)
+
+	addr := startTestServer(t, newTestStore())
+
+	// Fill the single slot and make sure it's counted (PING forces the
+	// accept path to have run before we dial the second connection).
+	conn1, r1 := dialServer(t, addr)
+	sendBytes(t, conn1, []byte("*1\r\n$4\r\nPING\r\n"))
+	if got := readResp(t, r1); got != "+PONG\r\n" {
+		t.Fatalf("first client PING = %q, want +PONG", got)
+	}
+
+	// Second client is accepted at TCP level, then rejected with an error.
+	conn2, r2 := dialServer(t, addr)
+	conn2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if got := readResp(t, r2); got != "-ERR max number of clients reached\r\n" {
+		t.Errorf("second client got %q, want -ERR max number of clients reached", got)
+	}
+}

@@ -7,22 +7,15 @@ import (
 	"strings"
 )
 
-// trafficLog is the shared logger for client<->server communication.
-// It stays nil unless enableTrafficLogging is called, so the test binary
-// (which calls serve()/handleConn() directly, never main()) prints nothing.
-var trafficLog *log.Logger
+var commandLog *log.Logger
 
-// enableTrafficLogging turns on per-command traffic logging to stdout.
-// log.Logger is safe for concurrent use, so many connection goroutines can
-// share one logger without their lines interleaving mid-message.
-func enableTrafficLogging() {
-	trafficLog = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
+func enablecommandLogging() {
+	commandLog = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 }
 
-// logComm writes a traffic line when logging is enabled; otherwise it's a no-op.
 func logComm(format string, args ...any) {
-	if trafficLog != nil {
-		trafficLog.Printf(format, args...)
+	if commandLog != nil {
+		commandLog.Printf(format, args...)
 	}
 }
 
