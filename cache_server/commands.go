@@ -508,3 +508,64 @@ func cmdClient(store Store, state *clientState, args []string) Reply {
 		return errReply(fmt.Sprintf("ERR Unknown subcommand or wrong number of arguments for '%s'. Try CLIENT HELP.", args[1]))
 	}
 }
+
+func cmdSubscribe(store Store, state *clientState, args []string) Reply {
+	for _, channel := range args[1:] {
+		if _, ok := state.subs[channel]; !ok {
+			state.subs[channel] = struct{}{}
+			state.hub.subscribe(channel, state)
+		}
+		state.write(state.protocol_version, arrayReply([]Reply{
+			bulkReply([]byte("subscribe")),
+			bulkReply([]byte(channel)),
+			intReply(int64(len(state.subs))),
+		}))
+	}
+	return noReply
+}
+
+func cmdUnsubscribe(store Store, state *clientState, args []string) Reply {
+	proto := state.protocol_version
+	if len(args) == 1 {
+		// No channels named: unsubscribe from all. Redis still emits exactly one
+		// reply (nil channel, count 0) when the client wasn't subscribed to anything.
+		if len(state.subs) == 0 {
+			state.write(proto, arrayReply([]Reply{
+				bulkReply([]byte("unsubscribe")), nullReply(), intReply(0),
+			}))
+			return noReply
+		}
+		for channel := range state.subs {
+			state.hub.unsubscribe(channel, state)
+			delete(state.subs, channel)
+			state.write(proto, arrayReply([]Reply{
+				bulkReply([]byte("unsubscribe")),
+				bulkReply([]byte(channel)),
+				intReply(int64(len(state.subs))),
+			}))
+		}
+		return noReply
+	}
+	for _, channel := range args[1:] {
+		if _, ok := state.subs[channel]; ok {
+			state.hub.unsubscribe(channel, state)
+			delete(state.subs, channel)
+		}
+		state.write(proto, arrayReply([]Reply{
+			bulkReply([]byte("unsubscribe")),
+			bulkReply([]byte(channel)),
+			intReply(int64(len(state.subs))),
+		}))
+	}
+	return noReply
+}
+
+func cmdPublish(store Store, state *clientState, args []string) Reply {
+	channel, payload := args[1], args[2]
+	receivers := state.hub.publish(channel, arrayReply([]Reply{
+		bulkReply([]byte("message")),
+		bulkReply([]byte(channel)),
+		bulkReply([]byte(payload)),
+	}))
+	return intReply(int64(receivers))
+}

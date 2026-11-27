@@ -5,7 +5,7 @@ from django.views.generic import ListView
 from rest_framework.views import APIView
 from rest_framework.response import Response
 
-from go_cache_server.demo.base.tasks import send_welcome_email
+from demo.base.tasks import send_welcome_email
 from .models import Post, Author
 from .serializers import *
 

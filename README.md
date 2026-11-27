@@ -91,11 +91,18 @@ The old HTTP/JSON demo client (`go_client.py`) and its custom cache backend (`ba
 
 | Path | Responsibility |
 |---|---|
-| `cache_server/main.go` | `MemoryStore` (strings with TTLs + lists/sets/sorted sets, used-memory accounting, `ErrOOM`/`ErrWrongType`), `Config` (maxmemory/maxclients, runtime-mutable), `serve` accept loop with the maxclients cap, per-connection handler, `main()` with `-addr`/`-maxclients`/`-maxmemory`/`-log` flags |
+| `cache_server/main.go` | `Config` (maxmemory/maxclients, runtime-mutable), `serve` accept loop with the maxclients cap, per-connection handler, `main()` with `-addr`/`-maxclients`/`-maxmemory`/`-log` flags |
+| `cache_server/cache_store.go` | `Store` interface and `MemoryStore` (strings with TTLs + lists/sets/sorted sets, used-memory accounting, `ErrOOM`/`ErrWrongType`) |
 | `cache_server/parser.go` | RESP codec: `readCommand` decoder, `writeReply` encoder, `Reply` type (incl. null arrays for BRPOP timeouts) |
 | `cache_server/logging.go` | Optional traffic logger (`-log`): `[conn N]`-tagged per-command `-->`/`<--` lines, with one-line sanitizing and truncation of large values/collections |
 | `cache_server/commands.go` | Command/arity table, `dispatch`, per-command handlers, `parseMemSize`, CONFIG GET/SET |
-| `cache_server/main_test.go` | Store unit tests + codec/dispatch/handler tests |
+| `cache_server/pubsub.go` | `PubSub` channel registry: subscribe/unsubscribe/publish and per-connection cleanup |
+| `demo/` | Django demo app (RedisCache + Celery) and `probe_commands.py` ecosystem probes |
+| `cache_server/cache_store_test.go` | Store unit tests: strings/TTL/expiry, lists/sets/sorted sets, OOM budget, wrong-type guards, used-memory accounting |
+| `cache_server/commands_test.go` | Command-table/dispatch tests, handler tests, `parseMemSize`/`parseScoreBound`, CONFIG GET/SET |
+| `cache_server/parser_test.go` | RESP codec tests: `writeReply` encoder and `readCommand` decoder, including limits and truncation |
+| `cache_server/pubsub_test.go` | Pub/sub unit tests (subscribe/unsubscribe/publish/cleanup) plus raw-socket delivery tests |
+| `cache_server/logging_test.go` | Traffic-log formatting: sanitizing, quoting, arg/reply summaries, nil-logger silence |
 | `cache_server/e2e_test.go` | Raw-socket end-to-end tests asserting exact wire bytes |
 | `IMPLEMENTATION_GUIDE.md` | Learning guide: step-by-step implementation plans for EXEC/MULTI, the SET options refactor, and GET extensions |
 | `security_report.md` | Full security audit (2026-11): findings with severities + remediation roadmap |
