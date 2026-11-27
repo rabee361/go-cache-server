@@ -35,7 +35,6 @@ func (h *PubSub) unsubscribe(channel string, st *clientState) {
 	h.remove(channel, st)
 }
 
-// remove drops st from one channel's subscriber set. Caller must hold h.mu.
 func (h *PubSub) remove(channel string, st *clientState) {
 	if m := h.channels[channel]; m != nil {
 		delete(m, st)
@@ -46,7 +45,6 @@ func (h *PubSub) remove(channel string, st *clientState) {
 	}
 }
 
-// removeClient drops every subscription a disconnecting client still held.
 func (h *PubSub) removeClient(st *clientState) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -55,9 +53,6 @@ func (h *PubSub) removeClient(st *clientState) {
 	}
 }
 
-// publish delivers msg to each subscriber of channel and returns the receiver
-// count. Subscribers are snapshotted under the lock and written to outside it,
-// so one slow client can't hold up the hub or the publisher for everyone else.
 func (h *PubSub) publish(channel string, msg Reply) int {
 	h.mu.RLock()
 	subs := make([]*clientState, 0, len(h.channels[channel]))
